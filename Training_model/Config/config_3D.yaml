@@ -1,0 +1,65 @@
+# ============================
+# General Settings
+# ============================
+env: "cluster"   #"local" or "cluster"
+training_mode: "3D"   # "2D" trains on annotated frames only; "3D" trains on full volumes
+save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_3D"
+experiment_name: "First_test"
+
+seed: 42
+device: "cuda"   # or "cpu"
+
+# ============================
+# Data Settings
+# ============================
+paths:
+  local:
+    data_root: ["W:/rubenvdw/Dataset/3D_Grayscale_Circularmask_Zscorenorm_Dicoms_Segmentations_16012026"]
+    split_excel: "W:/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "W:/rubenvdw/Conditional_INR/Patches_preprocessed_3D"
+  cluster:
+    data_root: ["/data/diag/rubenvdw/Dataset/3D_Grayscale_Circularmask_Zscorenorm_Dicoms_Segmentations_16012026"]
+    split_excel: "/data/diag/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "/data/diag/rubenvdw/Conditional_INR/Patches_preprocessed_3D"
+train_batch_size: 4
+
+# ============================
+# Model Settings
+# ============================
+model_seg_decoder:
+  out_channels: 12   # Number of segmentation classes
+  feature_size: 64
+  mapping_activated: True
+  mapping:
+    0: 0 # Background
+    1: 1 # Lumen
+    2: 2 # Guidewire
+    3: 3 # Intima
+    4: 4 # Lipid
+    5: 5 # Calcium
+    6: 6 # Media
+    7: 1 # Catheter
+    8: 7 # Sidebranch
+    9: 8 # Red thrombus
+    10: 8 # White thrombus
+    11: 3 # Dissection
+    12: 9 # Plaque rupture
+    13: 10 # Layered plaque
+    14: 11 # Neovascularization
+    15: 3 # Intraplaque hemorrhage
+    16: 3 # Intramural hematoma
+
+# ============================
+# Training Settings
+# ============================
+training_segmentation:
+  epochs: 400
+  warmup_epochs: 20        # LR ramps from initial_lr*0.1 → initial_lr over these epochs
+  lr_settings:
+    initial_lr: 0.0003
+    weight_decay: 0.0001
+  val_interval: 5   # Validate every n epochs
+  ignore_index: 255  # Sentinel for truly unlabeled pixels; must not equal any real class (0-11)
+  feature_supervision: False        # Not used in 3D mode (full_label is always empty)
+  tv_loss_weight: 0.0               # TV loss disabled — weight 1.0 overwhelmed CE/Dice in Test 4
+  patch_z: 32                       # z-frames per 3D training patch (centered on annotated frame)

@@ -1,0 +1,70 @@
+# ============================
+# General Settings
+# ============================
+env: "cluster"   #"local" or "cluster"
+training_mode: "2D"   # "2D" trains on annotated frames only; "3D" trains on full volumes
+save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_2D"
+experiment_name: "First_test_encoder_only"
+context_frames: 3     # frames of context before/after annotated frame (2D mode only)
+
+seed: 42
+device: "cuda"   # or "cpu"
+
+# ============================
+# Data Settings
+# ============================
+paths:
+  local:
+    # data_root: ["W:/rubenvdw/Dataset/DICOMS_Pectus", "W:/CARAlab_datasets/ORANGE_Thijs"]
+    data_root: ["W:/rubenvdw/Dataset/3D_Grayscale_Dicoms_Segmentations_12classes_23022026"]
+    split_excel: "W:/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    frames_folder: "W:/rubenvdw/Conditional_INR/Frames_preprocessed_2D_7frames"
+  cluster:
+    # data_root: ["/data/diag/rubenvdw/Dataset/DICOMS_Pectus", "/data/diag/CARAlab_datasets/ORANGE_Thijs"]
+    data_root: ["/data/diag/rubenvdw/Dataset/3D_Grayscale_Dicoms_Segmentations_12classes_23022026"]
+    split_excel: "/data/diag/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    frames_folder: "/data/diag/rubenvdw/Conditional_INR/Frames_preprocessed_2D_7frames"
+train_batch_size: 4
+
+# ============================
+# Model Settings
+# ============================
+model_seg_decoder:
+  out_channels: 12   # Number of segmentation classes
+  feature_size: 64
+  global_feat_ch: 32
+  encoder_only: True   # true = skip UNet decoder, interpolate bottleneck to input res
+  mapping_activated: False
+  mapping:
+    0: 0 # Background
+    1: 1 # Lumen
+    2: 2 # Guidewire
+    3: 3 # Intima
+    4: 4 # Lipid
+    5: 5 # Calcium
+    6: 6 # Media
+    7: 1 # Catheter
+    8: 7 # Sidebranch
+    9: 8 # Red thrombus
+    10: 8 # White thrombus
+    11: 3 # Dissection
+    12: 9 # Plaque rupture
+    13: 10 # Layered plaque
+    14: 11 # Neovascularization
+    15: 3 # Intraplaque hemorrhage
+    16: 3 # Intramural hematoma
+
+# ============================
+# Training Settings
+# ============================
+training_segmentation:
+  epochs: 400
+  warmup_epochs: 20        # LR ramps from initial_lr*0.1 → initial_lr over these epochs
+  lr_settings:
+    initial_lr: 0.0003
+    weight_decay: 0.0001
+  val_interval: 5   # Validate every n epochs
+  ignore_index: 255  # Sentinel for truly unlabeled pixels; must not equal any real class (0-11)
+  feature_supervision: True        # Auxiliary loss on encoder features (deep supervision)
+  feature_supervision_weight: 0.2   # Weight of the auxiliary loss relative to main loss
+  tv_loss_weight: 0.0               # TV loss disabled — weight 1.0 overwhelmed CE/Dice in Test 4
