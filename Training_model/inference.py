@@ -4,11 +4,8 @@ import torch
 from config import Config
 from model import (
     ConditionalINR,
-    normalize_coords_for_grid_sample,
     normalize_coords_for_grid_sample_2d,
-    sample_features,
     sample_features_2d,
-    scale_to_mm,
     scale_to_mm_2d,
 )
 
@@ -49,21 +46,14 @@ def predict_pullback(
             pad   = np.broadcast_to(patch[-1:], (pz - actual_len, H, W))
             patch = np.concatenate([patch, pad], axis=0)
 
-        vol_t    = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float().to(device)
-        feat_vol = model.encoder(vol_t)   # [1, feat_ch, pz, H/8, W/8]
+        vol_t           = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float().to(device)
+        feat_vol, skips = model.encoder(vol_t)   # [1, feat_ch, pz, H/8, W/8], list
 
         patch_pred = np.zeros(pz * H * W, dtype=np.int64)
         for s in range(0, len(patch_coords), chunk_size):
             e      = min(s + chunk_size, len(patch_coords))
             coords = torch.from_numpy(patch_coords[s:e]).unsqueeze(0).to(device)
-
-            center      = coords.new_tensor([(W - 1) / 2.0, (H - 1) / 2.0, 0.0])
-            coords_mm   = scale_to_mm(coords - center, cfg)
-            pe          = model.pe(coords_mm)
-            coords_norm = normalize_coords_for_grid_sample(coords, (pz, H, W))
-            feat        = sample_features(feat_vol, coords_norm)
-
-            logits = model.inr(torch.cat([pe, feat], dim=-1))   # [1, chunk, C]
+            logits = model.decode_3d(feat_vol, skips, coords, (pz, H, W))
             patch_pred[s:e] = logits.argmax(dim=-1).squeeze(0).cpu().numpy()
 
         predictions[z_start:z_end] = patch_pred.reshape(pz, H, W)[:actual_len]
@@ -89,7 +79,7 @@ def predict_frame_2d(
     frame_tensor = (
         torch.from_numpy(frame).unsqueeze(0).float().to(device)
     )  # [1, C, H, W]
-    feat_map, global_feat = model.encoder(frame_tensor)   # encode once, reuse for all chunks
+    feat_map, global_feat, skip_maps = model.encoder(frame_tensor)   # encode once, reuse for all chunks
     # global_feat: [1, global_ch] — same for every chunk, broadcast per coordinate batch
 
     yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
@@ -110,6 +100,8 @@ def predict_frame_2d(
         N           = feat.shape[1]
         g_feat_exp  = global_feat.unsqueeze(1).expand(-1, N, -1)
         feat        = torch.cat([feat, g_feat_exp], dim=-1)
+        for skip_map in skip_maps:
+            feat = torch.cat([feat, sample_features_2d(skip_map, coords_norm)], dim=-1)
 
         logits = model.inr(torch.cat([pe, feat], dim=-1))   # [1, chunk, C]
         predictions[start:end] = logits.argmax(dim=-1).squeeze(0).cpu().numpy()

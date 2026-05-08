@@ -48,9 +48,12 @@ def smoothness_loss(
     probs   = torch.softmax(logits_seq, dim=-1)        # [B, F, C]
     diff    = (probs[:, 1:] - probs[:, :-1]).abs()     # [B, F-1, C]
 
-    weights = torch.ones(cfg.num_classes, device=logits_seq.device)
-    for idx in cfg.device_class_indices:
-        weights[idx] = cfg.device_smoothness_weight / cfg.smoothness_weight
+    if cfg.smoothness_class_indices:
+        weights = torch.zeros(cfg.num_classes, device=logits_seq.device)
+        for idx in cfg.smoothness_class_indices:
+            weights[idx] = 1.0
+    else:
+        weights = torch.ones(cfg.num_classes, device=logits_seq.device)
 
     return (diff * weights.unsqueeze(0).unsqueeze(0)).mean()
 

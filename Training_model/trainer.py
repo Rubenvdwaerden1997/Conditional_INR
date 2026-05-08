@@ -170,28 +170,38 @@ def _save_vis_predictions(
 
 def _sample_smoothness_logits(
     model: ConditionalINR,
-    volume: torch.Tensor,
+    feat_vol: torch.Tensor,    # [B, feat_ch, D, H, W] — pre-computed, detached
+    skips: list,               # intermediate encoder maps, detached
+    volume_shape,              # full volume shape (B, 1, D, H, W)
     cfg: Config,
     device: torch.device,
+    n_spatial: int = 8,
 ) -> torch.Tensor:
-    """Sample the model at one central (x, y) point across every z frame.
+    """Compute smoothness logits using pre-computed encoder features.
 
-    Returns [B, D, C] logits used to compute the z-smoothness loss.
-    Lightweight: one coordinate per frame, not N_points.
+    Reuses the encoder output from the main forward pass (detached) so the
+    encoder runs only once per batch and its gradient is not doubled.
+    Returns [B, D, C] logits averaged over n_spatial random spatial positions.
     """
-    B, _, D, H, W = volume.shape
-    cx = float(W) / 2
-    cy = float(H) / 2
+    B, _, D, H, W = volume_shape
+    z_all = torch.arange(D, dtype=torch.float32, device=device)
 
-    z_coords = torch.arange(D, dtype=torch.float32, device=device)
-    coords_single = torch.stack([
-        torch.full_like(z_coords, cx),
-        torch.full_like(z_coords, cy),
-        z_coords,
-    ], dim=-1)                                              # [D, 3]
-    coords_batch = coords_single.unsqueeze(0).expand(B, -1, -1)  # [B, D, 3]
+    xs = torch.rand(n_spatial, device=device) * (W - 1)
+    ys = torch.rand(n_spatial, device=device) * (H - 1)
 
-    return model(volume, coords_batch)                      # [B, D, C]
+    coords_list = []
+    for k in range(n_spatial):
+        coords_list.append(torch.stack([
+            torch.full_like(z_all, xs[k]),
+            torch.full_like(z_all, ys[k]),
+            z_all,
+        ], dim=-1))                                                 # [D, 3]
+    coords_all   = torch.cat(coords_list, dim=0)                   # [n_spatial*D, 3]
+    coords_batch = coords_all.unsqueeze(0).expand(B, -1, -1)       # [B, n_spatial*D, 3]
+
+    logits_flat = model.decode_3d(feat_vol, skips, coords_batch, (D, H, W))
+    logits      = logits_flat.view(B, n_spatial, D, cfg.num_classes)
+    return logits.mean(dim=1)                                       # [B, D, C]
 
 
 def train_one_epoch(
@@ -215,17 +225,21 @@ def train_one_epoch(
         labels     = labels.to(device)
         full_label = full_label.to(device)
 
-        if cfg.feature_supervision:
-            logits, dense_pred = model(volume, coords, return_feat_logits=True)
+        if cfg.training_mode == "3D":
+            feat_vol, skips = model.encoder(volume)
+            logits          = model.decode_3d(feat_vol, skips, coords, volume.shape[2:])
+            smooth_logits   = _sample_smoothness_logits(
+                model, feat_vol.detach(), [s.detach() for s in skips],
+                volume.shape, cfg, device,
+            )
+            dp = None
         else:
-            logits = model(volume, coords)
-
-        smooth_logits = (
-            _sample_smoothness_logits(model, volume, cfg, device)
-            if cfg.training_mode == "3D"
-            else None
-        )
-        dp    = dense_pred if cfg.feature_supervision else None
+            if cfg.feature_supervision:
+                logits, dense_pred = model(volume, coords, return_feat_logits=True)
+            else:
+                logits = model(volume, coords)
+            smooth_logits = None
+            dp = dense_pred if cfg.feature_supervision else None
         loss, log = compute_loss(logits, labels, cfg, smooth_logits, dp)
 
         if cfg.feature_supervision and full_label.numel() > 0:
@@ -341,14 +355,28 @@ def train(
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=4, pin_memory=True,
+        num_workers=8, pin_memory=True, persistent_workers=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
-        num_workers=2, pin_memory=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
     )
 
     model     = ConditionalINR(cfg).to(device)
+
+    def _count_params(module):
+        return sum(p.numel() for p in module.parameters())
+
+    total_params   = _count_params(model)
+    encoder_params = _count_params(model.encoder)
+    inr_params     = _count_params(model.inr)
+    logger.info(
+        f"Model parameters — "
+        f"total: {total_params:,}  |  "
+        f"encoder: {encoder_params:,}  |  "
+        f"INR: {inr_params:,}"
+    )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                    weight_decay=cfg.weight_decay)
 
@@ -435,7 +463,7 @@ def train(
                                 tv_weight=cfg.tv_weight,
                                 class_names=_ITKSNAP_LABELS, class_colors=_ITKSNAP_COLORS)
 
-        if epoch % 50 == 0 or epoch == 5:
+        if epoch % max(1, cfg.num_epochs // 10) == 0 or epoch == 5:
             _save_vis_predictions(
                 vis_entries, model, cfg, device, epoch,
                 cfg.checkpoint_dir, label_mapping=label_mapping,

@@ -31,9 +31,9 @@ class Config:
     dice_weight:       float = 1.0
     smoothness_weight: float = 0.1
 
-    # Device classes (stent, shadow, …) get relaxed smoothness — can appear/disappear fast
-    device_class_indices:    List[int] = field(default_factory=lambda: [2])
-    device_smoothness_weight: float    = 0.05
+    # Classes to apply smoothness to. Empty list = all classes.
+    # Device classes (stent, shadow, …) are typically excluded as they can appear/disappear fast.
+    smoothness_class_indices: List[int] = field(default_factory=list)
 
     # Inference: ignore predictions beyond this many frames from nearest labeled frame
     max_propagation_frames: int = 45   # ≈ 4.5 mm at 0.1 mm/frame
@@ -84,12 +84,26 @@ class Config:
     # Faster and uses less memory; loses the skip-connection detail.
     encoder_only: bool = False
 
+    # Intermediate encoder features (2D + 3D): sample skip feature maps at each
+    # query coordinate and concatenate them into the INR input.
+    # Gives the MLP direct access to multi-scale context at every resolution.
+    # Adds b + 2b + 4b = 7b dims to the INR input (b = encoder_feat // 4).
+    # 2D: samples s1/s2/s3 (full, ½, ¼ res).  3D: samples s_stem/s2/s3 (½, ½, ¼ res).
+    use_intermediate_features: bool = False
+
     # Spatial TV regularisation weight applied to the dense feature-head output.
     # Penalises isolated wrong-class predictions (e.g. background inside lumen).
     # Only active when feature_supervision=True (dense head must be enabled).
-    tv_weight: float = 0.05
+    tv_weight: float = 0.00
 
     # 3D patch-based training: number of z-frames loaded per sample.
     # Encoder sees this many frames; only the annotated frame within the patch
     # contributes to the supervised loss.  Patch is centered on the annotated frame.
     patch_z: int = 32
+
+    # Coordinate sampling strategy during training.
+    # "random"     — uniform random draw from labeled pixels (70 %) + random (30 %)
+    # "stratified" — labeled budget split equally across present classes, so rare
+    #                classes (calcium, thrombus, …) get the same representation as
+    #                dominant ones (lumen, intima, background).
+    sampling_strategy: str = "stratified"

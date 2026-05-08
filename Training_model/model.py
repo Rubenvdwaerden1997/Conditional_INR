@@ -213,9 +213,12 @@ class Encoder3D(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-    def __init__(self, in_ch: int = 1, feat_ch: int = 64):
+    def __init__(self, in_ch: int = 1, feat_ch: int = 64,
+                 use_intermediate_features: bool = False):
         super().__init__()
         b = feat_ch // 4   # base channels (16 for feat_ch=64)
+        self.b = b
+        self.use_intermediate_features = use_intermediate_features
 
         # Strided stem: immediate 2× xy reduction — avoids storing a full-res [Z,H,W] activation
         self.stem = nn.Sequential(
@@ -239,13 +242,21 @@ class Encoder3D(nn.Module):
         self.pool   = nn.MaxPool3d(kernel_size=(1, 2, 2))   # xy-only pooling
         self.out_ch = feat_ch
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """[B, 1, Z, H, W]  →  [B, feat_ch, Z, H//8, W//8]"""
-        x = self.stem(x)              # [B, b,   Z, H/2, W/2]
-        x = self.enc2(x)              # [B, 2b,  Z, H/2, W/2]
-        x = self.enc3(self.pool(x))   # [B, 4b,  Z, H/4, W/4]
-        x = self.enc4(self.pool(x))   # [B, 4b,  Z, H/8, W/8]
-        return self.z_conv(x)         # [B, feat_ch, Z, H/8, W/8]
+    def forward(self, x: torch.Tensor):
+        """[B, 1, Z, H, W]  →  (feat [B, feat_ch, Z, H//8, W//8], skip_maps)
+
+        skip_maps is [s_stem, s2, s3] with shapes
+          [B, b, Z, H/2, W/2], [B, 2b, Z, H/2, W/2], [B, 4b, Z, H/4, W/4]
+        or an empty list when use_intermediate_features is False.
+        """
+        s_stem = self.stem(x)                 # [B, b,   Z, H/2, W/2]
+        s2     = self.enc2(s_stem)            # [B, 2b,  Z, H/2, W/2]
+        s3     = self.enc3(self.pool(s2))     # [B, 4b,  Z, H/4, W/4]
+        s4     = self.enc4(self.pool(s3))     # [B, 4b,  Z, H/8, W/8]
+        feat   = self.z_conv(s4)              # [B, feat_ch, Z, H/8, W/8]
+
+        skip_maps = [s_stem, s2, s3] if self.use_intermediate_features else []
+        return feat, skip_maps
 
 
 # ---------------------------------------------------------------------------
@@ -280,10 +291,11 @@ class Encoder2D(nn.Module):
         )
 
     def __init__(self, in_ch: int = 1, feat_ch: int = 64, global_ch: int = 32,
-                 encoder_only: bool = False):
+                 encoder_only: bool = False, use_intermediate_features: bool = False):
         super().__init__()
         b = feat_ch // 4   # base channel count  (16 for feat_ch=64)
-        self.encoder_only = encoder_only
+        self.encoder_only             = encoder_only
+        self.use_intermediate_features = use_intermediate_features
 
         self.enc1 = self._block(in_ch, b)          # full res  → [B, b,   H,   W]
         self.enc2 = self._block(b,     b * 2)      # ×½ res    → [B, 2b,  H/2, W/2]
@@ -313,8 +325,13 @@ class Encoder2D(nn.Module):
         )
         self.global_ch = global_ch
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """[B, in_ch, H, W]  →  ([B, feat_ch, H, W], [B, global_ch])"""
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, list]:
+        """[B, in_ch, H, W]  →  ([B, feat_ch, H, W], [B, global_ch], skip_maps)
+
+        skip_maps is a list of raw encoder feature maps [s1, s2, s3] with
+        shapes [B, b, H, W], [B, 2b, H/2, W/2], [B, 4b, H/4, W/4], or an
+        empty list when use_intermediate_features is False.
+        """
         H, W = x.shape[2], x.shape[3]
         s1 = self.enc1(x)                                          # [B, b,   H,   W]
         s2 = self.enc2(self.pool(s1))                              # [B, 2b,  H/2, W/2]
@@ -323,9 +340,11 @@ class Encoder2D(nn.Module):
 
         global_feat = self.global_proj(s4)                         # [B, global_ch]
 
+        skip_maps: list = [s1, s2, s3] if self.use_intermediate_features else []
+
         if self.encoder_only:
             feat = F.interpolate(s4, size=(H, W), mode="bilinear", align_corners=False)
-            return self.out_conv(feat), global_feat                # [B, feat_ch, H, W], [B, global_ch]
+            return self.out_conv(feat), global_feat, skip_maps
 
         d3 = self.dec3(torch.cat([F.interpolate(s4, size=s3.shape[2:], mode="bilinear",
                                                 align_corners=False), s3], dim=1))
@@ -334,7 +353,7 @@ class Encoder2D(nn.Module):
         d1 = self.dec1(torch.cat([F.interpolate(d2, size=s1.shape[2:], mode="bilinear",
                                                 align_corners=False), s1], dim=1))
 
-        return self.out_conv(d1), global_feat                      # [B, feat_ch, H, W], [B, global_ch]
+        return self.out_conv(d1), global_feat, skip_maps
 
 
 # ---------------------------------------------------------------------------
@@ -387,19 +406,27 @@ class ConditionalINR(nn.Module):
         self.mode_2d = cfg.training_mode == "2D"
 
         if self.mode_2d:
-            in_ch = 2 * cfg.context_frames + 1
+            in_ch        = 2 * cfg.context_frames + 1
             self.encoder = Encoder2D(in_ch=in_ch, feat_ch=cfg.encoder_feat,
                                      global_ch=cfg.global_feat_ch,
-                                     encoder_only=cfg.encoder_only)
+                                     encoder_only=cfg.encoder_only,
+                                     use_intermediate_features=cfg.use_intermediate_features)
             self.pe      = PositionalEncoding2D(num_freqs_xy=cfg.num_freqs_xy)
-            in_dim = self.pe.out_dim + cfg.encoder_feat + cfg.global_feat_ch
+            # s1 + s2 + s3 raw channel counts: b + 2b + 4b = 7b  (b = encoder_feat // 4)
+            b = cfg.encoder_feat // 4
+            skip_dims = (b + 2 * b + 4 * b) if cfg.use_intermediate_features else 0
+            in_dim = self.pe.out_dim + cfg.encoder_feat + cfg.global_feat_ch + skip_dims
         else:
-            self.encoder = Encoder3D(in_ch=1, feat_ch=cfg.encoder_feat)
+            self.encoder = Encoder3D(in_ch=1, feat_ch=cfg.encoder_feat,
+                                     use_intermediate_features=cfg.use_intermediate_features)
             self.pe      = AnisotropicPositionalEncoding(
                 num_freqs_xy=cfg.num_freqs_xy,
                 num_freqs_z=cfg.num_freqs_z,
             )
-            in_dim = self.pe.out_dim + cfg.encoder_feat
+            # s_stem + s2 + s3 raw channel counts: b + 2b + 4b = 7b
+            b_3d = cfg.encoder_feat // 4
+            skip_dims_3d = (b_3d + 2 * b_3d + 4 * b_3d) if cfg.use_intermediate_features else 0
+            in_dim = self.pe.out_dim + cfg.encoder_feat + skip_dims_3d
 
         self.inr = INR(in_dim=in_dim, hidden=cfg.inr_hidden,
                        out_dim=cfg.num_classes, depth=cfg.inr_depth)
@@ -419,6 +446,30 @@ class ConditionalINR(nn.Module):
         else:
             self.feature_head = None
 
+    def decode_3d(
+        self,
+        feat_vol: torch.Tensor,   # [B, feat_ch, D, H, W]
+        skips: list,              # intermediate encoder maps
+        coords: torch.Tensor,     # [B, N, 3]  voxel space (x, y, z)
+        volume_shape: tuple,      # (D, H, W)
+    ) -> torch.Tensor:            # [B, N, num_classes]
+        """Feature sampling + PE + INR for 3D queries.
+
+        Exposed so the training loop can run the encoder once and pass cached
+        (detached) features to the smoothness pass, avoiding a double forward.
+        """
+        D, H, W     = volume_shape
+        coords_norm = normalize_coords_for_grid_sample(coords, (D, H, W))
+        feat        = sample_features(feat_vol, coords_norm)
+        for skip_map in skips:
+            feat = torch.cat([feat, sample_features(skip_map, coords_norm)], dim=-1)
+        # Centre xy at catheter and z at patch midpoint so the PE reflects
+        # distance from the structural centre, not from the patch edge.
+        center    = coords.new_tensor([(W - 1) / 2.0, (H - 1) / 2.0, (D - 1) / 2.0])
+        coords_mm = scale_to_mm(coords - center, self.cfg)
+        pe        = self.pe(coords_mm)
+        return self.inr(torch.cat([pe, feat], dim=-1))
+
     def forward(
         self,
         volume: torch.Tensor,            # [B, 1, H, W] (2D) or [B, 1, D, H, W] (3D)
@@ -427,33 +478,35 @@ class ConditionalINR(nn.Module):
     ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
         # [B, N, num_classes], or (logits, feat_logits) both [B, N, num_classes]
         if self.mode_2d:
-            H, W              = volume.shape[2], volume.shape[3]
-            feat_vol, g_feat  = self.encoder(volume)                        # [B, C, H, W], [B, global_ch]
-            coords_norm       = normalize_coords_for_grid_sample_2d(coords, (H, W))
-            feat              = sample_features_2d(feat_vol, coords_norm)   # [B, N, C]
-            N                 = feat.shape[1]
-            g_feat_exp        = g_feat.unsqueeze(1).expand(-1, N, -1)       # [B, N, global_ch]
-            feat              = torch.cat([feat, g_feat_exp], dim=-1)       # [B, N, C+global_ch]
+            H, W                     = volume.shape[2], volume.shape[3]
+            feat_vol, g_feat, skips  = self.encoder(volume)                        # [B, C, H, W], [B, G], list
+            coords_norm              = normalize_coords_for_grid_sample_2d(coords, (H, W))
+            feat                     = sample_features_2d(feat_vol, coords_norm)   # [B, N, C]
+            N                        = feat.shape[1]
+            g_feat_exp               = g_feat.unsqueeze(1).expand(-1, N, -1)       # [B, N, global_ch]
+            feat                     = torch.cat([feat, g_feat_exp], dim=-1)       # [B, N, C+global_ch]
+            # Sample each intermediate skip map at the same query coordinates.
+            # align_corners=True ensures the same [-1, 1] range maps to the same
+            # physical location regardless of each feature map's spatial resolution.
+            for skip_map in skips:
+                feat = torch.cat([feat, sample_features_2d(skip_map, coords_norm)], dim=-1)
             # Shift origin to image center (catheter location) before PE so the
             # encoding reflects distance from catheter, not distance from top-left.
-            center            = coords.new_tensor([(W - 1) / 2.0, (H - 1) / 2.0])
-            coords_mm         = scale_to_mm_2d(coords - center, self.cfg)
+            center                   = coords.new_tensor([(W - 1) / 2.0, (H - 1) / 2.0])
+            coords_mm                = scale_to_mm_2d(coords - center, self.cfg)
         else:
-            D, H, W     = volume.shape[2], volume.shape[3], volume.shape[4]
-            feat_vol    = self.encoder(volume)                              # [B, C, D, H, W]
-            coords_norm = normalize_coords_for_grid_sample(coords, (D, H, W))
-            feat        = sample_features(feat_vol, coords_norm)           # [B, N, C]
-            # Center x, y at catheter; leave z as frame index (no symmetry along pullback).
-            center      = coords.new_tensor([(W - 1) / 2.0, (H - 1) / 2.0, 0.0])
-            coords_mm   = scale_to_mm(coords - center, self.cfg)
+            D, H, W         = volume.shape[2], volume.shape[3], volume.shape[4]
+            feat_vol, skips = self.encoder(volume)
+            logits          = self.decode_3d(feat_vol, skips, coords, (D, H, W))
+            if return_feat_logits and self.feature_head is not None:
+                return logits, self.feature_head(feat_vol)
+            return logits
 
+        # --- 2D only below this point ---
         pe     = self.pe(coords_mm)                                        # [B, N, pe_dim]
         logits = self.inr(torch.cat([pe, feat], dim=-1))                   # [B, N, num_classes]
 
         if return_feat_logits and self.feature_head is not None:
-            # Dense prediction over the full feature map — [B, num_classes, H, W]
-            # (or D, H, W in 3D). Supervised against the full GT frame in the
-            # training loop; never called at inference time.
             return logits, self.feature_head(feat_vol)
 
         return logits

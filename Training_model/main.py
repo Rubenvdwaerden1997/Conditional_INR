@@ -49,8 +49,12 @@ def build_config(yml: dict) -> Config:
         feature_supervision_weight  = tr.get("feature_supervision_weight", 0.5),
         global_feat_ch              = seg.get("global_feat_ch", 32),
         encoder_only                = seg.get("encoder_only", False),
+        use_intermediate_features   = seg.get("use_intermediate_features", False),
         tv_weight                   = tr.get("tv_loss_weight", 0.0),
         patch_z                     = tr.get("patch_z", 32),
+        sampling_strategy           = tr.get("sampling_strategy", "random"),
+        smoothness_weight           = tr.get("smoothness_weight", 0.1),
+        smoothness_class_indices    = tr.get("smoothness_class_indices", []),
     )
 
 

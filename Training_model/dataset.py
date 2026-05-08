@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import torch
+from scipy.ndimage import rotate as nd_rotate
 from torch.utils.data import Dataset
 
 from config import Config
@@ -308,9 +309,31 @@ class OCTPullbackDataset(Dataset):
         if np.random.rand() < 0.5:
             volume = volume[:, :, ::-1].copy()
             labels = labels[:, :, ::-1].copy()
+
+        # Random in-plane (x/y) rotation — identical angle for all z-frames
+        angle  = np.random.uniform(0.0, 360.0)
+        volume = nd_rotate(volume, angle, axes=(1, 2), reshape=False,
+                           order=1, mode="constant", cval=0.0)
+        labels = nd_rotate(labels, angle, axes=(1, 2), reshape=False,
+                           order=0, mode="constant", cval=self.cfg.ignore_index)
+
         gain   = np.random.uniform(0.8, 1.2)
         volume = volume * gain
         return volume, labels
+
+    def _stratified_sample(self, indices: np.ndarray, label_vals: np.ndarray,
+                           n: int) -> np.ndarray:
+        """Sample n indices equally distributed across unique classes in label_vals."""
+        classes   = np.unique(label_vals)
+        n_per_cls = max(1, n // len(classes))
+        chosen    = []
+        for c in classes:
+            pool = indices[label_vals == c]
+            chosen.append(pool[np.random.choice(len(pool), size=min(n_per_cls, len(pool)),
+                                                replace=True)])
+        result = np.concatenate(chosen, axis=0)
+        # Trim to exactly n (rounding may overshoot by at most n_classes-1)
+        return result[:n]
 
     def _sample_coords(self, volume: np.ndarray, labels: np.ndarray):
         """Sample N query coordinates, biased 70 % toward labeled pixels."""
@@ -333,11 +356,16 @@ class OCTPullbackDataset(Dataset):
             return coords[:, [2, 1, 0]], point_labels   # → (x, y, z)
 
         if self.mode == "train":
-            chosen = labeled_zyx[
-                np.random.choice(len(labeled_zyx),
-                                 size=min(n_labeled, len(labeled_zyx)),
-                                 replace=True)
-            ]
+            label_vals = labels[labeled_zyx[:, 0], labeled_zyx[:, 1], labeled_zyx[:, 2]]
+            if self.cfg.sampling_strategy == "stratified":
+                chosen = self._stratified_sample(labeled_zyx, label_vals,
+                                                 min(n_labeled, len(labeled_zyx)))
+            else:
+                chosen = labeled_zyx[
+                    np.random.choice(len(labeled_zyx),
+                                     size=min(n_labeled, len(labeled_zyx)),
+                                     replace=True)
+                ]
             n_random      = self.n_pts - len(chosen)
             random_zyx    = np.random.randint([0, 0, 0], [D, H, W], size=(n_random, 3))
             random_labels = labels[random_zyx[:, 0], random_zyx[:, 1], random_zyx[:, 2]]
@@ -387,11 +415,23 @@ class OCTPullbackDataset(Dataset):
         return frame, label_frame
 
     def _augment_2d(self, frame: np.ndarray, label_frame: np.ndarray):
-        """Horizontal flip + brightness jitter for a single 2-D frame."""
+        """Horizontal flip + random rotation + brightness jitter for a single 2-D frame."""
         if np.random.rand() < 0.5:
             # frame is [H, W] or [C, H, W] — flip the W axis in both cases
             frame       = np.flip(frame, axis=-1).copy()
             label_frame = label_frame[:, ::-1].copy()
+
+        # Random in-plane (x/y) rotation — OCT frames are rotationally symmetric
+        angle = np.random.uniform(0.0, 360.0)
+        rot_axes = (1, 2) if frame.ndim == 3 else None   # [C,H,W] vs [H,W]
+        frame = (nd_rotate(frame, angle, axes=rot_axes, reshape=False,
+                           order=1, mode="constant", cval=0.0)
+                 if rot_axes is not None else
+                 nd_rotate(frame, angle, reshape=False,
+                           order=1, mode="constant", cval=0.0))
+        label_frame = nd_rotate(label_frame, angle, reshape=False,
+                                order=0, mode="constant", cval=self.cfg.ignore_index)
+
         gain  = np.random.uniform(0.8, 1.2)
         frame = frame * gain
         return frame, label_frame
@@ -414,11 +454,16 @@ class OCTPullbackDataset(Dataset):
             return coords[:, [1, 0]], point_labels   # → (x, y)
 
         if self.mode == "train":
-            chosen = labeled_yx[
-                np.random.choice(len(labeled_yx),
-                                 size=min(n_labeled, len(labeled_yx)),
-                                 replace=True)
-            ]
+            label_vals = label_frame[labeled_yx[:, 0], labeled_yx[:, 1]]
+            if self.cfg.sampling_strategy == "stratified":
+                chosen = self._stratified_sample(labeled_yx, label_vals,
+                                                 min(n_labeled, len(labeled_yx)))
+            else:
+                chosen = labeled_yx[
+                    np.random.choice(len(labeled_yx),
+                                     size=min(n_labeled, len(labeled_yx)),
+                                     replace=True)
+                ]
             n_random      = self.n_pts - len(chosen)
             random_yx     = np.random.randint([0, 0], [H, W], size=(n_random, 2))
             random_labels = label_frame[random_yx[:, 0], random_yx[:, 1]]
