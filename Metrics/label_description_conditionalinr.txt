@@ -1,0 +1,29 @@
+################################################
+# ITK-SnAP Label Description File
+# Matches the Conditional INR 12-class post-mapping taxonomy
+# (Training_model/dataset.py _DEFAULT_LABEL_MAPPING / the "mapping" section
+# in Config/Conditional/*.yaml) -- NOT the raw ~17-class annotation taxonomy.
+#
+# Label names are chosen to match exactly what
+# nnunetv2/Codes/utils/plaque_quantification.py's quantification_lipid()/
+# quantification_calcium() look up via name_to_idx.get(...), so classes that
+# were already merged at label-mapping time (Catheter->Lumen, Red/White
+# Thrombus->Thrombus, Dissection/Intraplaque hemorrhage/Intramural
+# hematoma->Intima) behave correctly without needing separate entries:
+# "Red Thrombus" below is deliberately used to name our merged Thrombus
+# class (idx 8) so quantification_lipid/calcium's lumen_labels grouping
+# still includes it (thrombus is lumen-occluding), matching the reference
+# taxonomy's intent.
+################################################
+    0     0    0    0        0  0  0    "Clear Label"
+    1   255    0    0        1  1  1    "Lumen"
+    2    63   63   63        1  1  1    "Guidewire"
+    3     0    0  255        1  1  1    "Intima"
+    4   255  255    0        1  1  1    "Lipiden"
+    5   210  210  210        1  1  1    "Calcium"
+    6   255    0  255        1  1  1    "Media"
+    7   255  123    0        1  1  1    "Sidebranch"
+    8   230  141  230        1  1  1    "Red Thrombus"
+    9   208  190  161        1  1  1    "Plaque rupture"
+   10     0  255    0        1  1  1    "Healed plaque"
+   11   162  162  162        1  1  1    "Neovascularization"

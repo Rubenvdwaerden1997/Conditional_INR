@@ -50,6 +50,9 @@ def save_training_plots(
     save_dir: str,
     feature_supervision: bool = False,
     tv_weight: float = 0.0,
+    smoothness_2d_weight: float = 0.0,
+    radial_media_prior_weight: float = 0.0,
+    radial_guidewire_prior_weight: float = 0.0,
     class_names: Optional[List[str]] = None,
     class_colors: Optional[np.ndarray] = None,
 ) -> None:
@@ -63,14 +66,22 @@ def save_training_plots(
     # Panel 1 — training loss components                                  #
     # ------------------------------------------------------------------ #
     ax = axes[0]
-    ax.plot(epochs, history["train_loss"],  label="Total",      linewidth=2)
-    ax.plot(epochs, history["ce_loss"],     label="CE",         linestyle="--")
-    ax.plot(epochs, history["dice_loss"],   label="Dice",       linestyle="--")
-    ax.plot(epochs, history["smooth_loss"], label="Smoothness", linestyle="--")
+    ax.plot(epochs, history["train_loss"],  label="Total",       linewidth=2)
+    if any(v > 0 for v in history.get("mse_loss", [])):
+        ax.plot(epochs, history["mse_loss"], label="MSE", linestyle="--")
+    ax.plot(epochs, history["ce_loss"],     label="CE",          linestyle="--")
+    ax.plot(epochs, history["dice_loss"],   label="Dice",        linestyle="--")
+    ax.plot(epochs, history["smooth_loss"], label="Smooth3D",    linestyle="--")
+    if smoothness_2d_weight > 0 and "spatial_smooth_loss" in history:
+        ax.plot(epochs, history["spatial_smooth_loss"], label="Smooth2D", linestyle="--")
     if feature_supervision:
         ax.plot(epochs, history["feat_sup_loss"], label="FeatSup", linestyle="--")
     if tv_weight > 0 and "tv_loss" in history:
         ax.plot(epochs, history["tv_loss"], label="TV", linestyle="--")
+    if radial_media_prior_weight > 0 and "radial_media_loss" in history:
+        ax.plot(epochs, history["radial_media_loss"], label="RadialMedia", linestyle="--")
+    if radial_guidewire_prior_weight > 0 and "radial_gwire_loss" in history:
+        ax.plot(epochs, history["radial_gwire_loss"], label="RadialGwire", linestyle="--")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title("Training Loss")

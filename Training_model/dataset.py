@@ -16,6 +16,7 @@ from scipy.ndimage import rotate as nd_rotate
 from torch.utils.data import Dataset
 
 from config import Config
+from model import resize_volume, resize_labels
 
 
 _DEFAULT_LABEL_MAPPING: Dict[int, int] = {
@@ -68,6 +69,36 @@ class OCTPullbackDataset(Dataset):
         self.augment           = augment and (mode == "train")
         self.label_mapping     = label_mapping if label_mapping is not None else _DEFAULT_LABEL_MAPPING
         self.mapping_activated = mapping_activated
+
+        self._file_cache: Dict[str, Dict] = {}
+        if cfg.preload_data and mode == "train":
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import time
+            files = sorted({e["file"] for e in entries})
+            n = len(files)
+            frac = max(0.0, min(1.0, cfg.preload_frac))
+            n_preload = max(1, int(round(n * frac)))
+            preload_files = files[:n_preload]
+            print(f"Preloading {n_preload}/{n} files into RAM "
+                  f"({int(frac * 100)}% upfront, rest lazy-cached during training)...")
+            report_every = max(1, n_preload // 20)
+            def _load_one(f):
+                return f, dict(np.load(f, allow_pickle=False))
+            done = 0
+            t0 = time.time()
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(_load_one, f): f for f in preload_files}
+                for future in as_completed(futures):
+                    f, data = future.result()
+                    self._file_cache[f] = data
+                    done += 1
+                    if done % report_every == 0 or done == n_preload:
+                        elapsed = time.time() - t0
+                        rate = done / elapsed if elapsed > 0 else 0
+                        eta = (n_preload - done) / rate if rate > 0 else float("inf")
+                        print(f"  Preloading {done * 100 // n_preload}% ({done}/{n_preload}) "
+                              f"— {rate:.1f} files/s, ETA {eta:.0f}s")
+            print("Preloading done.")
 
     # ------------------------------------------------------------------
     # Factory
@@ -157,6 +188,64 @@ class OCTPullbackDataset(Dataset):
         print(f"[{set_excel}] {len(entries)} {unit} found.")
         return cls(entries, cfg, **kwargs)
 
+    @classmethod
+    def from_single_volume(
+        cls,
+        npz_path: str,
+        annotated_frames: List[int],
+        cfg: Config,
+        mode: str = "train",
+        **kwargs,
+    ) -> "OCTPullbackDataset":
+        """Build a dataset from one .npz for unconditional INR overfitting.
+
+        Train set is repeated cfg.unconditional_n_repeats times so the DataLoader
+        produces that many batches per epoch, each with freshly sampled coordinates.
+        The file is preloaded into the in-memory cache at construction time.
+        """
+        npz_path = str(npz_path)
+        entry = {
+            "file":             npz_path,
+            "pullback":         Path(npz_path).stem,
+            "unconditional":    True,
+            "annotated_frames": annotated_frames,
+        }
+        n       = cfg.unconditional_n_repeats if mode == "train" else 1
+        entries = [entry] * n
+        ds      = cls(entries, cfg, mode=mode, augment=(mode == "train"), **kwargs)
+        # Preload file once
+        if npz_path not in ds._file_cache:
+            ds._file_cache[npz_path] = dict(np.load(npz_path, allow_pickle=False))
+
+        # Precompute labeled coords once — avoids rebuilding a [D,H,W] array every step
+        data = ds._file_cache[npz_path]
+        vol  = data["Volume_input_image"]
+        if vol.ndim == 4: vol = vol[0]
+        segm = data["Segmentation_image"]
+        if segm.ndim == 4: segm = segm[0]
+        segm = segm.astype(np.int64)
+        if kwargs.get("mapping_activated", True) and kwargs.get("label_mapping") is not None:
+            segm = ds._remap(segm, kwargs["label_mapping"])
+        D, H, W = vol.shape
+        if cfg.resize_to:
+            H = W = cfg.resize_to   # vol itself is unused beyond .shape — only labels need resizing
+
+        labels = np.full((D, H, W), cfg.ignore_index, dtype=np.int64)
+        for z in annotated_frames:
+            if 0 <= z < D:
+                label_frame = segm[z]
+                if cfg.resize_to:
+                    label_frame = resize_labels(torch.from_numpy(label_frame), cfg.resize_to).numpy()
+                labels[z] = label_frame
+        labeled_mask = labels != cfg.ignore_index
+        labeled_zyx  = np.argwhere(labeled_mask).astype(np.int32)   # [M, 3]
+        label_vals   = labels[labeled_zyx[:, 0], labeled_zyx[:, 1], labeled_zyx[:, 2]].astype(np.int32)
+
+        ds._unc_labeled_zyx  = labeled_zyx   # [M, 3] (z, y, x)
+        ds._unc_label_vals   = label_vals    # [M]
+        ds._unc_volume_shape = (D, H, W)
+        return ds
+
     # ------------------------------------------------------------------
 
     def __len__(self):
@@ -164,6 +253,9 @@ class OCTPullbackDataset(Dataset):
 
     def __getitem__(self, idx):
         entry = self.entries[idx]
+
+        if entry.get("unconditional"):
+            return self._get_unconditional(entry)
 
         if self.cfg.training_mode == "2D":
             frame, label_frame = self._load_2d(entry)
@@ -188,12 +280,53 @@ class OCTPullbackDataset(Dataset):
             torch.from_numpy(volume).unsqueeze(0).float(),                 # [1, patch_z, H, W]
             torch.from_numpy(coords).float(),                               # [N, 3]
             torch.from_numpy(point_labels).long(),                          # [N]
-            torch.empty(0, dtype=torch.long),                              # dense supervision not used in 3D
+            torch.from_numpy(labels).long(),                               # [patch_z, H, W] dense GT (255 for unannotated frames)
         )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _get_unconditional(self, entry: Dict):
+        """Sample coords+labels from the precomputed labeled-pixel arrays.
+
+        No per-call allocation of the full [D,H,W] volume — all heavy work is
+        done once at from_single_volume() construction time.
+        """
+        D, H, W     = self._unc_volume_shape
+        labeled_zyx = self._unc_labeled_zyx   # [M, 3]  int32
+        label_vals  = self._unc_label_vals    # [M]     int32
+
+        # Sample integer positions into labeled_zyx rather than the coords themselves,
+        # so we can look up both coordinates and labels cheaply after sampling.
+        positions = np.arange(len(labeled_zyx), dtype=np.int64)
+
+        if self.mode == "train":
+            _sample_fn = (
+                self._stratified_sample_with_bg_floor
+                if self.cfg.background_floor_frac > 0
+                else self._stratified_sample
+            )
+            chosen_pos   = _sample_fn(positions, label_vals, self.n_pts)
+            coords_zyx   = labeled_zyx[chosen_pos]
+            point_labels = label_vals[chosen_pos]
+        else:
+            max_pts = self.n_pts * 4
+            if len(labeled_zyx) > max_pts:
+                stride     = max(1, len(labeled_zyx) // max_pts)
+                idx        = np.arange(0, len(labeled_zyx), stride)[:max_pts]
+            else:
+                idx        = np.arange(len(labeled_zyx))
+            coords_zyx   = labeled_zyx[idx]
+            point_labels = label_vals[idx]
+
+        coords = coords_zyx[:, [2, 1, 0]].astype(np.float32)  # (z,y,x) → (x,y,z)
+        return (
+            torch.tensor([D, H, W], dtype=torch.long),
+            torch.from_numpy(coords).float(),
+            torch.from_numpy(point_labels.astype(np.int64)).long(),
+            torch.empty(0, dtype=torch.long),
+        )
 
     def _load(self, entry: Dict):
         """Load .npz, normalise volume, mask non-annotated frames."""
@@ -231,31 +364,34 @@ class OCTPullbackDataset(Dataset):
             Validation: middle annotated frame (deterministic).
         """
         if entry.get("prebuilt_3d"):
-            data            = np.load(entry["file"], allow_pickle=False)
-            buffer          = data["patch"].astype(np.float32)   # [2*patch_z, H, W]
-            label_frame     = data["label"].astype(np.int64)     # [H, W]  already remapped
-            z_local_buffer  = int(data["z_local"])               # annotated frame in buffer
-            pz              = self.cfg.patch_z
-            buf_size        = buffer.shape[0]                    # == 2*patch_z
+            data = self._file_cache.get(entry["file"]) or dict(np.load(entry["file"], allow_pickle=False))
+            buffer         = data["patch"].astype(np.float32)    # [2*patch_z, H, W]
+            z_local_buffer = int(data["z_local"])                # primary annotated frame in buffer
+            if "labels" in data:
+                labels_buf = data["labels"].astype(np.int64)     # [2*patch_z, H, W] — 255 for unannotated
+            else:
+                # old format: single label [H,W] at z_local; fill rest with ignore_index
+                labels_buf = np.full(buffer.shape, self.cfg.ignore_index, dtype=np.int64)
+                labels_buf[z_local_buffer] = data["label"].astype(np.int64)
+            pz             = self.cfg.patch_z
+            buf_size       = buffer.shape[0]                     # == 2*patch_z
 
             if self.mode == "train":
-                # Random sub-window: annotated frame lands anywhere in [0, pz-1]
+                # Random sub-window: primary annotated frame lands anywhere in [0, pz-1]
                 s_min = max(0, z_local_buffer - (pz - 1))
                 s_max = min(buf_size - pz, z_local_buffer)
                 s     = int(np.random.randint(s_min, s_max + 1))
             else:
-                # Fixed centre sub-window for deterministic validation
-                s = (buf_size - pz) // 2
+                # Fixed sub-window centred on the primary annotated frame (deterministic)
+                s = int(np.clip(z_local_buffer - pz // 2, 0, buf_size - pz))
 
-            patch_vol   = buffer[s : s + pz]
-            z_local     = z_local_buffer - s
-            _, H, W     = patch_vol.shape
-            patch_labels = np.full((pz, H, W), self.cfg.ignore_index, dtype=np.int64)
-            patch_labels[z_local] = label_frame
+            patch_vol    = buffer[s : s + pz]
+            patch_labels = labels_buf[s : s + pz]               # all annotated frames in window included
+            patch_vol, patch_labels = self._resize_xy_labels(patch_vol, patch_labels)
             return patch_vol, patch_labels
 
         # --- on-the-fly fallback ---
-        data = np.load(entry["file"], allow_pickle=False)
+        data = self._file_cache.get(entry["file"]) or dict(np.load(entry["file"], allow_pickle=False))
 
         vol = data["Volume_input_image"]
         if vol.ndim == 4:
@@ -291,10 +427,12 @@ class OCTPullbackDataset(Dataset):
             pad       = pz - patch_vol.shape[0]
             patch_vol = np.pad(patch_vol, ((0, pad), (0, 0), (0, 0)), mode="edge")
 
+        _, H, W      = patch_vol.shape
         patch_labels = np.full((pz, H, W), self.cfg.ignore_index, dtype=np.int64)
-        z_local      = z_center - z_start
-        patch_labels[z_local] = segm[z_center]
-
+        for z_ann in ann:
+            if z_start <= z_ann < z_end:
+                patch_labels[z_ann - z_start] = segm[z_ann]
+        patch_vol, patch_labels = self._resize_xy_labels(patch_vol, patch_labels)
         return patch_vol, patch_labels
 
     def _remap(self, seg: np.ndarray, merge_map: Dict[int, int]) -> np.ndarray:
@@ -303,6 +441,32 @@ class OCTPullbackDataset(Dataset):
         for old, new in merge_map.items():
             lut[old] = new
         return lut[seg]
+
+    def _resize_xy_labels(self, volume: np.ndarray, labels: np.ndarray):
+        """Resize volume [Z, H, W] and labels [Z, H, W] together.
+
+        Labels use nearest-neighbour so class boundaries stay crisp.
+        No-op when cfg.resize_to == 0.
+        """
+        size = self.cfg.resize_to
+        if not size:
+            return volume, labels
+        volume = resize_volume(torch.from_numpy(volume), size).numpy()
+        labels = resize_labels(torch.from_numpy(labels), size).numpy()
+        return volume, labels
+
+    def _resize_xy(self, volume: np.ndarray, label_frame: np.ndarray):
+        """Resize the (H, W) dims of a volume/frame and its single label frame.
+
+        No-op when cfg.resize_to == 0. Bilinear for the image, nearest-neighbour
+        for labels so class boundaries stay crisp instead of being blended.
+        """
+        size = self.cfg.resize_to
+        if not size:
+            return volume, label_frame
+        volume      = resize_volume(torch.from_numpy(volume), size).numpy()
+        label_frame = resize_labels(torch.from_numpy(label_frame), size).numpy()
+        return volume, label_frame
 
     def _augment(self, volume: np.ndarray, labels: np.ndarray):
         """Safe OCT augmentations — no z-flips (pullback direction must stay intact)."""
@@ -329,11 +493,41 @@ class OCTPullbackDataset(Dataset):
         chosen    = []
         for c in classes:
             pool = indices[label_vals == c]
-            chosen.append(pool[np.random.choice(len(pool), size=min(n_per_cls, len(pool)),
-                                                replace=True)])
+            chosen.append(pool[np.random.choice(len(pool), size=n_per_cls, replace=True)])
         result = np.concatenate(chosen, axis=0)
         # Trim to exactly n (rounding may overshoot by at most n_classes-1)
         return result[:n]
+
+    def _stratified_sample_with_bg_floor(
+        self,
+        indices: np.ndarray,
+        label_vals: np.ndarray,
+        n: int,
+    ) -> np.ndarray:
+        """Stratified sample with a guaranteed minimum for background (class 0).
+
+        Reserves background_floor_frac * n_pts points for class 0, then
+        distributes the remainder equally across all other present classes.
+        Falls back to plain stratified if no background pixels are present.
+        """
+        n_bg_floor = int(self.cfg.background_floor_frac * self.n_pts)
+        bg_mask    = label_vals == 0
+        bg_idx     = indices[bg_mask]
+
+        if n_bg_floor == 0 or len(bg_idx) == 0:
+            return self._stratified_sample(indices, label_vals, n)
+
+        n_bg    = min(n_bg_floor, len(bg_idx))
+        n_other = max(0, n - n_bg)
+
+        bg_chosen = bg_idx[np.random.choice(len(bg_idx), size=n_bg, replace=True)]
+
+        other_idx  = indices[~bg_mask]
+        other_vals = label_vals[~bg_mask]
+        if n_other > 0 and len(other_idx) > 0:
+            other_chosen = self._stratified_sample(other_idx, other_vals, n_other)
+            return np.concatenate([bg_chosen, other_chosen], axis=0)
+        return bg_chosen[:n]
 
     def _sample_coords(self, volume: np.ndarray, labels: np.ndarray):
         """Sample N query coordinates, biased 70 % toward labeled pixels."""
@@ -358,16 +552,26 @@ class OCTPullbackDataset(Dataset):
         if self.mode == "train":
             label_vals = labels[labeled_zyx[:, 0], labeled_zyx[:, 1], labeled_zyx[:, 2]]
             if self.cfg.sampling_strategy == "stratified":
-                chosen = self._stratified_sample(labeled_zyx, label_vals,
-                                                 min(n_labeled, len(labeled_zyx)))
+                _sample_fn = (
+                    self._stratified_sample_with_bg_floor
+                    if self.cfg.background_floor_frac > 0
+                    else self._stratified_sample
+                )
+                chosen = _sample_fn(labeled_zyx, label_vals,
+                                    min(n_labeled, len(labeled_zyx)))
             else:
                 chosen = labeled_zyx[
                     np.random.choice(len(labeled_zyx),
                                      size=min(n_labeled, len(labeled_zyx)),
                                      replace=True)
                 ]
-            n_random      = self.n_pts - len(chosen)
-            random_zyx    = np.random.randint([0, 0, 0], [D, H, W], size=(n_random, 3))
+            n_random  = self.n_pts - len(chosen)
+            ann_z     = int(np.where(labeled_mask.any(axis=(1, 2)))[0][0])
+            random_yx = np.random.randint([0, 0], [H, W], size=(n_random, 2))
+            random_zyx = np.column_stack([
+                np.full(n_random, ann_z, dtype=np.int64),
+                random_yx,
+            ])
             random_labels = labels[random_zyx[:, 0], random_zyx[:, 1], random_zyx[:, 2]]
             all_zyx    = np.concatenate([chosen, random_zyx], axis=0)
             all_labels = np.concatenate([labels[chosen[:, 0], chosen[:, 1], chosen[:, 2]],
@@ -384,6 +588,11 @@ class OCTPullbackDataset(Dataset):
             all_labels = labels[all_zyx[:, 0], all_zyx[:, 1], all_zyx[:, 2]]
 
         coords = all_zyx[:, [2, 1, 0]].astype(np.float32)   # (z,y,x) → (x,y,z)
+        if self.mode == "train" and self.cfg.coord_jitter_max > 0:
+            jitter_xy = np.random.uniform(
+                -self.cfg.coord_jitter_max, self.cfg.coord_jitter_max, size=(coords.shape[0], 2)
+            ).astype(np.float32)
+            coords[:, :2] += jitter_xy   # x, y only -- z stays exactly on the labeled frame
         return coords, all_labels.astype(np.int64)
 
     # ------------------------------------------------------------------
@@ -392,7 +601,7 @@ class OCTPullbackDataset(Dataset):
 
     def _load_2d(self, entry: Dict):
         """Load a single annotated frame (or pre-built context stack) from .npz."""
-        data = np.load(entry["file"])
+        data = self._file_cache.get(entry["file"]) or dict(np.load(entry["file"]))
 
         if entry.get("prebuilt"):
             # Pre-split file: frame is [C, H, W], label is [H, W]
@@ -412,6 +621,7 @@ class OCTPullbackDataset(Dataset):
 
         if self.mapping_activated and self.label_mapping:
             label_frame = self._remap(label_frame, self.label_mapping)
+        frame, label_frame = self._resize_xy(frame, label_frame)
         return frame, label_frame
 
     def _augment_2d(self, frame: np.ndarray, label_frame: np.ndarray):
@@ -456,8 +666,13 @@ class OCTPullbackDataset(Dataset):
         if self.mode == "train":
             label_vals = label_frame[labeled_yx[:, 0], labeled_yx[:, 1]]
             if self.cfg.sampling_strategy == "stratified":
-                chosen = self._stratified_sample(labeled_yx, label_vals,
-                                                 min(n_labeled, len(labeled_yx)))
+                _sample_fn = (
+                    self._stratified_sample_with_bg_floor
+                    if self.cfg.background_floor_frac > 0
+                    else self._stratified_sample
+                )
+                chosen = _sample_fn(labeled_yx, label_vals,
+                                    min(n_labeled, len(labeled_yx)))
             else:
                 chosen = labeled_yx[
                     np.random.choice(len(labeled_yx),

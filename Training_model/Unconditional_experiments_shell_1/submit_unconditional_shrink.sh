@@ -1,0 +1,23 @@
+#! /bin/bash
+# Submit all unconditional theta-shrink experiments in parallel.
+# Each sbatch call queues an independent job — the cluster runs them
+# simultaneously on separate GPUs as resources become available.
+
+BASE=/data/diag/rubenvdw/Conditional_INR/Training_model
+
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden512_depth4.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden256_depth4.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden128_depth4.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden64_depth4.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden64_depth3.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden32_depth4.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden32_depth3.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden32_depth2.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden16_depth4.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden16_depth3.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden16_depth2.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden8_depth4.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden8_depth3.sh
+sbatch $BASE/Unconditional_experiments_shell_1/run_unconditional_hidden8_depth2.sh
+
+echo "Submitted 14 shrink jobs."

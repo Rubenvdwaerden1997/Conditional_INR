@@ -1,0 +1,114 @@
+# ============================
+# General Settings
+# ============================
+env: "cluster"   #"local" or "cluster"
+training_mode: "3D"   # "2D" trains on annotated frames only; "3D" trains on full volumes
+save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_3D_conditional"
+experiment_name: "conditional_3D_relu_cedice_trilinear_encoder64_depth5_nodense_radialprior_gwire10x"
+
+seed: 42
+device: "cuda"   # or "cpu"
+
+# ============================
+# Data Settings
+# ============================
+paths:
+  local:
+    data_root: ["W:/rubenvdw/Dataset/3D_Grayscale_Circularmask_Zscorenorm_Dicoms_Segmentations_16012026"]
+    split_excel: "W:/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "W:/rubenvdw/Conditional_INR/Patches_preprocessed_3D"
+  cluster:
+    data_root: ["/data/diag/rubenvdw/Dataset/3D_Grayscale_Circularmask_Zscorenorm_Dicoms_Segmentations_16012026"]
+    split_excel: "/data/diag/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "/data/diag/rubenvdw/Conditional_INR/Patches_preprocessed_3D"
+train_batch_size: 2
+
+# ============================
+# Model Settings
+# ============================
+model_seg_decoder:
+  out_channels: 12
+  feature_size: 64          # bigger encoder: 64 channels instead of 16 (~150k encoder params vs 11k)
+  use_local_features: True
+  use_dense_decoder: False  # isolates the radial-prior weight change on the depth5+relu baseline — no auxiliary CNN loss
+  dense_decoder_skip_connections: False   # irrelevant when use_dense_decoder is False
+  encoder_depth: 5          # matches depth5_nodense_relu (current best) — only change vs it is the radial prior loss
+  use_intermediate_features: False   # not yet implemented for encoder_depth=5 (INR path unaffected either way)
+  global_feat_ch: 64
+  dilation_xy: 1
+  encoder_z_strides: [1, 1, 2, 1, 1]   # Z downsamples once, centered (at layer3) — matches depth5_nodense_relu
+  feature_sampling: "trilinear"
+  inr_hidden: 128
+  inr_depth: 4
+  inr_activation: "relu"   # Fourier PE + concatenated features -> ReLU MLP, no periodic SIREN/FiLM
+  siren_omega_0: 30.0      # unused when inr_activation="relu"
+  num_freqs_xy: 4
+  num_freqs_z: 4
+  mapping_activated: True
+  mapping:
+    0: 0 # Background
+    1: 1 # Lumen
+    2: 2 # Guidewire
+    3: 3 # Intima
+    4: 4 # Lipid
+    5: 5 # Calcium
+    6: 6 # Media
+    7: 1 # Catheter
+    8: 7 # Sidebranch
+    9: 8 # Red thrombus
+    10: 8 # White thrombus
+    11: 3 # Dissection
+    12: 9 # Plaque rupture
+    13: 10 # Layered plaque
+    14: 11 # Neovascularization
+    15: 3 # Intraplaque hemorrhage
+    16: 3 # Intramural hematoma
+
+# ============================
+# Training Settings
+# ============================
+training_segmentation:
+  epochs: 300
+  warmup_epochs: 5
+  lr_settings:
+    initial_lr: 0.0003
+    weight_decay: 0.0001
+  val_interval: 5
+  ignore_index: 255
+  ignore_background: True
+  feature_supervision: False
+  tv_loss_weight: 0.0
+  smoothness_3d_weight: 0.0
+  smoothness_2d_weight: 0.0
+  smoothness_2d_n_pairs: 1024
+  smoothness_class_indices: [0,1,3,4,5,6,7,10]
+  # Radial anatomical prior, now with INDEPENDENT weights per term (2026-07-31 code change —
+  # previously a single radial_prior_weight applied to both, see config.py).
+  # Media-boundary term: kept at the same weight as the finished radialprior_noclip run (1.0) —
+  # that run confirmed this term is completely inert (raw radial_media_boundary stuck at exactly
+  # 0.0000 for the full 300 epochs, diluted by averaging over ~66 near/far ray-pairs per ray) —
+  # NOT raised here, changing an already-confirmed-dead term wouldn't test anything.
+  # Guidewire-truncation term: raised 1.0 -> 10.0. That run's raw radial_guidewire_truncation was
+  # demonstrably active (0.0392 @ epoch 1 -> ~0.002 @ epoch 300) but its ~0.1-1% contribution to
+  # total loss was too small to move Val Dice or fix the guidewire-truncation symptom visually.
+  # 10x raises epoch-1 contribution to ~0.4 against a total loss starting ~2.1 (~19%) — a real,
+  # non-negligible share without repeating the multiscale-collapse-scale risk a 50x jump would add.
+  # Watch train.log epochs 1-10 for: (a) RadialGwire actually decreasing, not flat, (b) total loss
+  # not diverging/spiking the way depth5_nodense_multiscale did at epoch 17.
+  radial_media_prior_weight: 1.0
+  radial_guidewire_prior_weight: 10.0
+  radial_prior_n_rays: 8
+  radial_prior_n_radii: 12
+  patch_z: 16
+  resize_to: 512
+  sampling_strategy: "random"
+  background_floor_frac: 0.0
+  n_points: 524288
+  preload_data: False
+  preload_frac: 0.3
+  use_amp: False
+  grad_clip_norm: 0.0   # matches the depth5_nodense_relu baseline exactly — clean single-variable comparison
+  loss_type: "ce_dice"
+  dense_decoder_weight: 1.0   # unused when use_dense_decoder is False
+  max_batches_frac: 0.25
+  val_interval_pct: 0.05

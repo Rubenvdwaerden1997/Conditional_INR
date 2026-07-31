@@ -1,0 +1,84 @@
+# ============================
+# Unconditional INR â€” overfit a single MLP on one 3D pullback (no encoder).
+# Maps AnisotropicPE(x, y, z) â†’ class logits directly.
+# Goal: find the smallest theta that still achieves high Dice on the target volume.
+# ============================
+env: "cluster"
+training_mode: "3D"
+unconditional: true
+unconditional_pullback: "NLD-ISALA-0007-LAD"         # pullback stem to overfit; empty = first in training set
+unconditional_n_repeats: 100       # dataset length = steps per epoch (batch_size=1 â†’ 100 steps/epoch)
+save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_unconditional/{unconditional_pullback}_res512"
+experiment_name: "unconditional_hidden512_depth4"
+
+seed: 42
+device: "cuda"
+
+# ============================
+# Data Settings
+# ============================
+paths:
+  local:
+    data_root: ["W:/rubenvdw/Dataset/3D_Grayscale_Circularmask_Zscorenorm_Dicoms_Segmentations_16012026"]
+    split_excel: "W:/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: ""
+  cluster:
+    data_root: ["/data/diag/rubenvdw/Dataset/3D_Grayscale_Circularmask_Zscorenorm_Dicoms_Segmentations_16012026"]
+    split_excel: "/data/diag/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: ""
+train_batch_size: 1
+
+# ============================
+# Model Settings
+# ============================
+model_seg_decoder:
+  out_channels: 12
+  feature_size: 64              # unused in unconditional mode, kept for build_config compatibility
+  use_intermediate_features: False
+  inr_hidden: 512               # start large to confirm overfit, then reduce to find minimum theta
+  inr_depth: 4
+  num_freqs_xy: 4
+  mapping_activated: True
+  mapping:
+    0: 0
+    1: 1
+    2: 2
+    3: 3
+    4: 4
+    5: 5
+    6: 6
+    7: 1
+    8: 7
+    9: 8
+    10: 8
+    11: 3
+    12: 9
+    13: 10
+    14: 11
+    15: 3
+    16: 3
+
+# ============================
+# Training Settings
+# ============================
+training_segmentation:
+  epochs: 500
+  warmup_epochs: 10
+  lr_settings:
+    initial_lr: 0.001           # higher LR than conditional â€” no encoder to destabilise
+    weight_decay: 0.0001
+  val_interval: 10
+  ignore_index: 255
+  feature_supervision: False
+  tv_loss_weight: 0.0
+  smoothness_3d_weight: 0.0
+  smoothness_2d_weight: 0.0
+  smoothness_2d_n_pairs: 256
+  smoothness_class_indices: []
+  patch_z: 32                   # unused in unconditional mode
+  resize_to: 512                  # if > 0, resize (H,W) to this at load time (bilinear image / nearest label)
+  sampling_strategy: "stratified"
+  background_floor_frac: 0.2
+  n_points: 16384
+  preload_data: False
+  preload_frac: 0.0

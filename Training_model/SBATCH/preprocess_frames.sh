@@ -5,12 +5,14 @@
 #SBATCH --time=24:00:00
 #SBATCH --container-mounts=/data/diag:/data/diag
 #SBATCH --container-image="dockerdex.umcn.nl:5005#rubenvdwaerden1997/train_monai:v1.4"
-#SBATCH -o ./Slurm_output_preprocess/_slurm_output_preprocess_frames_%j.txt
-#SBATCH -e ./Slurm_output_preprocess/_slurm_error_preprocess_frames_%j.txt
-#SBATCH --qos=low
+#SBATCH -o ./SLURM/Slurm_output_preprocess/_slurm_output_preprocess_frames_%j.txt
+#SBATCH -e ./SLURM/Slurm_output_preprocess/_slurm_error_preprocess_frames_%j.txt
+#SBATCH --qos=vram
 #SBATCH --exclude=dlc-mewtwo,dlc-moltres,dlc-nidoking,dlc-scyther,dlc-lugia,dlc-articuno,dlc-slowpoke
 
+echo "Running on node:" $(hostname)
+
 python3 -u /data/diag/rubenvdw/Conditional_INR/Training_model/preprocess_frames.py \
-    --config /data/diag/rubenvdw/Conditional_INR/Training_model/Config/config_3D.yaml \
+    --config /data/diag/rubenvdw/Conditional_INR/Training_model/Config/Conditional/config_3D_conditional.yaml \
     --mode 3d \
     --sets training validation testing

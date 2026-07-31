@@ -33,6 +33,11 @@ def build_config(yml: dict) -> Config:
         training_mode        = yml.get("training_mode", "3D"),
         num_classes          = seg["out_channels"],
         encoder_feat         = seg["feature_size"],
+        use_local_features   = seg.get("use_local_features", True),
+        use_dense_decoder    = seg.get("use_dense_decoder", False),
+        dense_decoder_weight = tr.get("dense_decoder_weight", 1.0),
+        dense_decoder_skip_connections = seg.get("dense_decoder_skip_connections", False),
+        encoder_depth        = seg.get("encoder_depth", 3),
         num_epochs           = tr["epochs"],
         lr                   = tr["lr_settings"]["initial_lr"],
         weight_decay         = tr["lr_settings"]["weight_decay"],
@@ -40,43 +45,82 @@ def build_config(yml: dict) -> Config:
         val_interval         = tr.get("val_interval", 5),
         warmup_epochs        = tr.get("warmup_epochs", 20),
         warmup_start_factor  = tr.get("warmup_start_factor", 0.1),
-        checkpoint_dir       = os.path.join(yml["save_root"], yml["experiment_name"]),
+        checkpoint_dir       = os.path.join(yml["save_root"].format(**yml), yml["experiment_name"]),
         context_frames       = yml.get("context_frames", 0),
         frames_folder         = yml["paths"][yml["env"]].get("frames_folder", ""),
         patches_folder_3d     = yml["paths"][yml["env"]].get("patches_folder_3d", ""),
         ignore_index                = tr.get("ignore_index", 255),
+        ignore_background           = tr.get("ignore_background", False),
         feature_supervision         = tr.get("feature_supervision", False),
         feature_supervision_weight  = tr.get("feature_supervision_weight", 0.5),
-        global_feat_ch              = seg.get("global_feat_ch", 32),
+        global_feat_ch              = seg.get("global_feat_ch", 64),
+        dilation_xy                 = seg.get("dilation_xy", 1),
         encoder_only                = seg.get("encoder_only", False),
         use_intermediate_features   = seg.get("use_intermediate_features", False),
+        inr_hidden                  = seg.get("inr_hidden", 512),
+        inr_depth                   = seg.get("inr_depth", 4),
         tv_weight                   = tr.get("tv_loss_weight", 0.0),
         patch_z                     = tr.get("patch_z", 32),
+        resize_to                   = tr.get("resize_to", 0),
         sampling_strategy           = tr.get("sampling_strategy", "random"),
-        smoothness_weight           = tr.get("smoothness_weight", 0.1),
-        smoothness_class_indices    = tr.get("smoothness_class_indices", []),
+        smoothness_3d_weight          = tr.get("smoothness_3d_weight", 0.0),
+        smoothness_class_indices      = tr.get("smoothness_class_indices", []),
+        smoothness_2d_weight          = tr.get("smoothness_2d_weight", 0.0),
+        smoothness_2d_n_pairs         = tr.get("smoothness_2d_n_pairs", 64),
+        radial_media_prior_weight     = tr.get("radial_media_prior_weight", 0.0),
+        radial_guidewire_prior_weight = tr.get("radial_guidewire_prior_weight", 0.0),
+        radial_prior_n_rays           = tr.get("radial_prior_n_rays", 8),
+        radial_prior_n_radii          = tr.get("radial_prior_n_radii", 12),
+        background_floor_frac       = tr.get("background_floor_frac", 0.0),
+        coord_jitter_max            = tr.get("coord_jitter_max", 0.0),
+        n_points                    = tr.get("n_points", 8192),
+        num_freqs_xy                = seg.get("num_freqs_xy", 6),
+        num_freqs_z                 = seg.get("num_freqs_z", 4),
+        inr_activation              = seg.get("inr_activation", "relu"),
+        siren_omega_0               = seg.get("siren_omega_0", 30.0),
+        preload_data                = tr.get("preload_data", False),
+        preload_frac                = tr.get("preload_frac", 0.5),
+        use_amp                     = tr.get("use_amp", False),
+        grad_clip_norm              = tr.get("grad_clip_norm", 0.0),
+        unconditional               = yml.get("unconditional", False),
+        unconditional_pullback      = yml.get("unconditional_pullback", ""),
+        unconditional_n_repeats     = yml.get("unconditional_n_repeats", 100),
+        loss_type                   = tr.get("loss_type", "mse_onehot"),
+        encoder_z_strides           = seg.get("encoder_z_strides", [1, 1, 1]),
+        feature_sampling            = seg.get("feature_sampling", "trilinear"),
+        max_batches_frac            = tr.get("max_batches_frac", 0.0),
+        val_interval_pct            = tr.get("val_interval_pct", 0.0),
     )
 
 
 def sanity_check(cfg: Config) -> None:
     """Quick forward-pass check with random tensors — no real data needed."""
-    print(f"=== Sanity check (random tensors, mode={cfg.training_mode}) ===")
+    from model import UnconditionalINR
+    print(f"=== Sanity check (random tensors, mode={cfg.training_mode}, unconditional={cfg.unconditional}) ===")
     device = torch.device("cpu")
-    model  = ConditionalINR(cfg)
 
     B, H, W, N = 2, 128, 128, 2048
-    if cfg.training_mode == "2D":
-        volume = torch.randn(B, 1, H, W)
-        coords = torch.rand(B, N, 2) * torch.tensor([W, H], dtype=torch.float32)
-    else:
-        D = 32
-        volume = torch.randn(B, 1, D, H, W)
-        coords = torch.rand(B, N, 3) * torch.tensor([W, H, D], dtype=torch.float32)
     labels = torch.randint(0, cfg.num_classes, (B, N))
     labels[0, :100] = cfg.ignore_index
 
-    logits     = model(volume, coords)
-    loss, log  = compute_loss(logits, labels, cfg)
+    if cfg.unconditional:
+        D      = 32
+        model  = UnconditionalINR(cfg)
+        coords = torch.rand(B, N, 3) * torch.tensor([W, H, D], dtype=torch.float32)
+        logits = model(coords, (D, H, W))
+    elif cfg.training_mode == "2D":
+        model  = ConditionalINR(cfg)
+        volume = torch.randn(B, 1, H, W)
+        coords = torch.rand(B, N, 2) * torch.tensor([W, H], dtype=torch.float32)
+        logits = model(volume, coords)
+    else:
+        D      = 32
+        model  = ConditionalINR(cfg)
+        volume = torch.randn(B, 1, D, H, W)
+        coords = torch.rand(B, N, 3) * torch.tensor([W, H, D], dtype=torch.float32)
+        logits = model(volume, coords)
+
+    loss, log    = compute_loss(logits, labels, cfg)
     mean_dice, _ = compute_dice(logits, labels, cfg.num_classes, cfg.ignore_index)
 
     print(f"  Logits shape     : {logits.shape}")
@@ -239,15 +283,58 @@ def main():
         label_mapping     = label_mapping,
     )
 
-    folders  = paths["data_root"]   # list in the YAML
-    train_ds = OCTPullbackDataset.from_excel(
-        folders, df_split, cfg, set_excel="training",
-        mode="train", augment=True, **dataset_kwargs,
-    )
-    val_ds = OCTPullbackDataset.from_excel(
-        folders, df_split, cfg, set_excel="validation",
-        mode="val", augment=False, **dataset_kwargs,
-    )
+    folders = paths["data_root"]   # list in the YAML
+
+    if cfg.unconditional:
+        # Find the target pullback and its annotated frames from the Excel
+        df_train = df_split[df_split["set"].str.lower() == "training"]
+        if cfg.unconditional_pullback:
+            row = df_train[df_train["pullback"].astype(str) == cfg.unconditional_pullback]
+            assert len(row) == 1, (
+                f"unconditional_pullback '{cfg.unconditional_pullback}' not found in training set"
+            )
+            target_pid = cfg.unconditional_pullback
+        else:
+            row        = df_train.iloc[[0]]
+            target_pid = str(row.iloc[0]["pullback"])
+
+        ann_frames = [
+            int(f.strip()) - 1
+            for f in str(row.iloc[0]["frames"]).split(",")
+            if f.strip().isdigit()
+        ]
+
+        from pathlib import Path as _Path
+        npz_path = None
+        for folder in folders:
+            for npz in _Path(folder).glob("*.npz"):
+                pid = npz.stem.replace("_circ_gray", "")
+                if pid == target_pid:
+                    npz_path = str(npz)
+                    break
+            if npz_path:
+                break
+        assert npz_path, f"Could not find .npz for pullback '{target_pid}' in {folders}"
+
+        print(
+            f"Unconditional mode — overfitting pullback '{target_pid}'  "
+            f"({len(ann_frames)} annotated frames: {ann_frames})"
+        )
+        train_ds = OCTPullbackDataset.from_single_volume(
+            npz_path, ann_frames, cfg, mode="train", **dataset_kwargs,
+        )
+        val_ds = OCTPullbackDataset.from_single_volume(
+            npz_path, ann_frames, cfg, mode="val", **dataset_kwargs,
+        )
+    else:
+        train_ds = OCTPullbackDataset.from_excel(
+            folders, df_split, cfg, set_excel="training",
+            mode="train", augment=True, **dataset_kwargs,
+        )
+        val_ds = OCTPullbackDataset.from_excel(
+            folders, df_split, cfg, set_excel="validation",
+            mode="val", augment=False, **dataset_kwargs,
+        )
 
     # -----------------------------------------------------------------------
     # Output dir + logger
@@ -257,8 +344,15 @@ def main():
     logger.info(f"Training mode : {cfg.training_mode}")
     logger.info(f"Config        : {args.config}")
     logger.info(f"Split         : {paths['split_excel']}")
+    resize_desc = f"{cfg.resize_to}x{cfg.resize_to}" if cfg.resize_to else f"native {cfg.native_xy_size}x{cfg.native_xy_size}"
+    logger.info(f"Resolution    : {resize_desc}  (xy_spacing={cfg.xy_spacing:.5f} mm/px)")
 
-    if cfg.training_mode == "2D":
+    if cfg.unconditional:
+        logger.info(f"Input volume shape (D,H,W): {train_ds._unc_volume_shape}")
+        logger.info(
+            f"Unconditional dataset — train steps: {len(train_ds)} | val: 1"
+        )
+    elif cfg.training_mode == "2D":
         logger.info(
             f"Samples (frames) — train: {len(train_ds)} | val: {len(val_ds)}"
         )

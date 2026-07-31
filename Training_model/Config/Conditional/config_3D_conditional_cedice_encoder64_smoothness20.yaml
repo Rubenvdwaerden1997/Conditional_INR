@@ -3,8 +3,8 @@
 # ============================
 env: "cluster"   #"local" or "cluster"
 training_mode: "3D"   # "2D" trains on annotated frames only; "3D" trains on full volumes
-save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_3D"
-experiment_name: "Fourth_test"
+save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_3D_conditional"
+experiment_name: "conditional_3D_siren_cedice_liif_encoder64_smoothness20"
 
 seed: 42
 device: "cuda"   # or "cpu"
@@ -21,15 +21,27 @@ paths:
     data_root: ["/data/diag/rubenvdw/Dataset/3D_Grayscale_Circularmask_Zscorenorm_Dicoms_Segmentations_16012026"]
     split_excel: "/data/diag/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
     patches_folder_3d: "/data/diag/rubenvdw/Conditional_INR/Patches_preprocessed_3D"
-train_batch_size: 4
+train_batch_size: 2
 
 # ============================
 # Model Settings
 # ============================
 model_seg_decoder:
-  out_channels: 12   # Number of segmentation classes
-  feature_size: 64
-  use_intermediate_features: True   # sample stem/enc2/enc3 at each query; adds 7b dims to INR input
+  out_channels: 12
+  feature_size: 64          # bigger encoder: 64 channels instead of 16 (~150k encoder params vs 11k)
+  use_local_features: True
+  use_dense_decoder: False
+  use_intermediate_features: False
+  global_feat_ch: 64
+  dilation_xy: 1
+  encoder_z_strides: [1, 2, 1]
+  feature_sampling: "liif"
+  inr_hidden: 128
+  inr_depth: 4
+  inr_activation: "siren"
+  siren_omega_0: 30.0
+  num_freqs_xy: 4
+  num_freqs_z: 4
   mapping_activated: True
   mapping:
     0: 0 # Background
@@ -54,16 +66,30 @@ model_seg_decoder:
 # Training Settings
 # ============================
 training_segmentation:
-  epochs: 100
-  warmup_epochs: 5        # LR ramps from initial_lr*0.1 → initial_lr over these epochs
+  epochs: 300
+  warmup_epochs: 5
   lr_settings:
     initial_lr: 0.0003
-    weight_decay: 0.001
-  val_interval: 5   # Validate every n epochs
-  ignore_index: 255  # Sentinel for truly unlabeled pixels; must not equal any real class (0-11)
-  feature_supervision: False        # Not used in 3D mode (full_label is always empty)
-  tv_loss_weight: 0.0               # TV loss disabled — weight 1.0 overwhelmed CE/Dice in Test 4
-  smoothness_weight: 1.0            # Weight for temporal smoothness loss
-  smoothness_class_indices: [1,3,4,5,6,7,10]      # Empty = all classes; list class indices to restrict (e.g. [0,1,3] to exclude stent class 2)
-  patch_z: 32                       # z-frames per 3D training patch (centered on annotated frame)
-  sampling_strategy: "stratified"       # "random" or "stratified" (equal samples per present class)
+    weight_decay: 0.0001
+  val_interval: 5
+  ignore_index: 255
+  ignore_background: True
+  feature_supervision: False
+  tv_loss_weight: 0.0
+  smoothness_3d_weight: 0.0
+  smoothness_2d_weight: 20.0   # raised from ineffective 0.05 (contributed ~0.0001 to total loss, never moved the raw term) — targets salt-and-pepper pixelation directly
+  smoothness_2d_n_pairs: 1024
+  smoothness_class_indices: [0,1,3,4,5,6,7,10]
+  patch_z: 16
+  resize_to: 512
+  sampling_strategy: "random"
+  background_floor_frac: 0.0
+  n_points: 524288
+  preload_data: False
+  preload_frac: 0.3
+  use_amp: False
+  grad_clip_norm: 0.0
+  loss_type: "ce_dice"
+  dense_decoder_weight: 0.0
+  max_batches_frac: 0.25
+  val_interval_pct: 0.05

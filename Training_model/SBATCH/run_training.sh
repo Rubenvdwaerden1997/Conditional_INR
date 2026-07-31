@@ -6,10 +6,12 @@
 #SBATCH --time=168:00:00
 #SBATCH --container-mounts=/data/diag:/data/diag
 #SBATCH --container-image="dockerdex.umcn.nl:5005#rubenvdwaerden1997/train_monai:v1.4"
-#SBATCH -o ./Slurm_output/_slurm_output_conditional_inr_%j.txt
-#SBATCH -e ./Slurm_output/_slurm_error_conditional_inr_%j.txt
+#SBATCH -o ./SLURM/Slurm_output/_slurm_output_conditional_inr_%j.txt
+#SBATCH -e ./SLURM/Slurm_output/_slurm_error_conditional_inr_%j.txt
 #SBATCH --qos=high
 #SBATCH --exclude=dlc-mewtwo,dlc-nidoking,dlc-scyther,dlc-slowpoke,dlc-zapdos,dlc-moltres,dlc-lugia
+
+echo "Running on node:" $(hostname)
 
 python3 -u /data/diag/rubenvdw/Conditional_INR/Training_model/main.py \
     --config /data/diag/rubenvdw/Conditional_INR/Training_model/Config/config.yaml

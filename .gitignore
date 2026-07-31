@@ -9,12 +9,18 @@ __pycache__/
 # Manual exclusion of folders and files
 saved_models_2D/
 saved_models_3D/
+saved_models_3D_*/
+saved_models_unconditional/
 Frames_preprocessed_2D_7frames/
 Patches_preprocessed_3D/
+Patches_preprocessed_3D_*/
 Example_data/
 Training_model/Slurm_output/
 Training_model/Slurm_output_3D/
 Training_model/Slurm_output_preprocess/
+Training_model/SLURM/
+SLURM/
+.claude/
 
 # Distribution / packaging
 .Python
@@ -115,5 +121,13 @@ ENV/
 *.dcm
 *.txt
 *.model
+*.pt
+*.pth
 .idea
 .idea/*
+
+# Small config/lookup-table .txt files that ARE part of the codebase, not data
+# or logs -- explicit exceptions to the blanket *.txt rule above (order matters:
+# these must come after it to re-include).
+!Metrics/12classes_3D_Model_Postprocessing.txt
+!Metrics/label_description_conditionalinr.txt
