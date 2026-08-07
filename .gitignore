@@ -21,6 +21,7 @@ Training_model/Slurm_output_preprocess/
 Training_model/SLURM/
 SLURM/
 .claude/
+Metrics/output/
 
 # Distribution / packaging
 .Python

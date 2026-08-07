@@ -71,6 +71,8 @@ def save_training_plots(
         ax.plot(epochs, history["mse_loss"], label="MSE", linestyle="--")
     ax.plot(epochs, history["ce_loss"],     label="CE",          linestyle="--")
     ax.plot(epochs, history["dice_loss"],   label="Dice",        linestyle="--")
+    if any(v > 0 for v in history.get("tversky_loss", [])):
+        ax.plot(epochs, history["tversky_loss"], label="Tversky", linestyle="--")
     ax.plot(epochs, history["smooth_loss"], label="Smooth3D",    linestyle="--")
     if smoothness_2d_weight > 0 and "spatial_smooth_loss" in history:
         ax.plot(epochs, history["spatial_smooth_loss"], label="Smooth2D", linestyle="--")

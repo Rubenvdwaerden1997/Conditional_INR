@@ -783,6 +783,7 @@ def train(
 
     history: Dict = {
         "epoch": [], "train_loss": [], "ce_loss": [], "dice_loss": [], "mse_loss": [],
+        "tversky_loss": [],
         "smooth_loss": [], "spatial_smooth_loss": [],
         "feat_sup_loss": [], "tv_loss": [], "dense_dec_loss": [],
         "radial_media_loss": [], "radial_gwire_loss": [],
@@ -799,7 +800,7 @@ def train(
         # stays the same length — a missing key would KeyError on the next epoch's
         # append, and an empty-but-present key would silently misalign the x-axis.
         n_done = len(history.get("epoch", []))
-        for key in ("radial_media_loss", "radial_gwire_loss"):
+        for key in ("radial_media_loss", "radial_gwire_loss", "tversky_loss"):
             if key not in history:
                 history[key] = [0.0] * n_done
 
@@ -824,6 +825,7 @@ def train(
         history["ce_loss"].append(train_log.get("ce", 0.0))
         history["dice_loss"].append(train_log.get("dice", 0.0))
         history["mse_loss"].append(train_log.get("mse_onehot", 0.0))
+        history["tversky_loss"].append(train_log.get("tversky", 0.0))
         history["smooth_loss"].append(train_log.get("smooth_3d", 0.0))
         history["spatial_smooth_loss"].append(train_log.get("smooth_2d", 0.0))
         history["feat_sup_loss"].append(train_log.get("feat_sup", 0.0))
@@ -838,6 +840,15 @@ def train(
                 f"Epoch {epoch:03d}/{cfg.num_epochs} | "
                 f"Train loss: {train_loss:.4f} "
                 f"(MSE={train_log.get('mse_onehot', 0):.4f} "
+                f"Smooth3D={train_log.get('smooth_3d', 0):.3f}"
+            )
+        elif cfg.loss_type == "tversky_ce":
+            log_str = (
+                f"Epoch {epoch:03d}/{cfg.num_epochs} | "
+                f"Train loss: {train_loss:.4f} "
+                f"(CE={train_log.get('ce', 0):.3f} "
+                f"Tversky={train_log.get('tversky', 0):.3f}"
+                f"(a={cfg.tversky_alpha},b={cfg.tversky_beta}) "
                 f"Smooth3D={train_log.get('smooth_3d', 0):.3f}"
             )
         else:

@@ -78,6 +78,13 @@ sys.path.insert(1, r"W:/rubenvdw/nnunetv2/nnUNet/nnunetv2/Codes/utils")
 sys.path.insert(1, "/data/diag/rubenvdw/nnunetv2/nnUNet/nnunetv2/Codes/utils")
 from plaque_quantification import quantification_lipid, quantification_calcium
 
+# create_html_report.py lives in this same Metrics/ folder -- reused here (rather
+# than duplicated) for the optional --html_report pass, so the two scripts share
+# one definition of the color map / JPEG-rendering / HTML-building logic. It is
+# intentionally torch-free, so importing it here adds no extra heavy deps beyond
+# opencv-python (cv2).
+from create_html_report import to_uint8_display, colorize, blend_overlay, save_jpg, get_class_colors, build_html
+
 _DEFAULT_POSTPROCESS_CONFIG = os.path.join(PIPELINE_DIR, "postprocessing_classes_conditionalinr.txt")
 _DEFAULT_LABEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "label_description_conditionalinr.txt")
 
@@ -284,6 +291,14 @@ def main():
     parser.add_argument("--label_file", type=str, default=_DEFAULT_LABEL_FILE,
                          help="ITK-SnAP label description matching this model's 12-class post-mapping taxonomy "
                               "(default: Metrics/label_description_conditionalinr.txt)")
+    parser.add_argument("--html_report", action="store_true",
+                         help="Also render an HTML QC report (OCT | GT | prediction JPEGs, browsable per "
+                              "pullback/frame) alongside the metrics -- see create_html_report.py. Reuses the "
+                              "volume/GT/prediction already in memory from this same run, so it adds no extra "
+                              "inference or file reads, just JPEG encoding per annotated frame.")
+    parser.add_argument("--html_alpha", type=float, default=0.45,
+                         help="Overlay transparency for the HTML report's GT/prediction color coding")
+    parser.add_argument("--html_jpeg_quality", type=int, default=90)
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -295,7 +310,10 @@ def main():
     if args.env:
         yml["env"] = args.env
 
-    output_dir = Path(args.output_dir) if args.output_dir else model_dir / "test_metrics"
+    # Default folder name encodes --overlap (0.5 -> "test_metrics_05", 1.0 -> "test_metrics_10")
+    # so different overlap runs land in separate folders instead of overwriting each other.
+    overlap_suffix = str(args.overlap).replace(".", "")
+    output_dir = Path(args.output_dir) if args.output_dir else model_dir / f"test_metrics_{overlap_suffix}"
     pred_dir   = output_dir / "predictions"
     output_dir.mkdir(parents=True, exist_ok=True)
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -312,6 +330,14 @@ def main():
     model, cfg, device = load_conditional_inr_model(str(model_dir), args.checkpoint, args.device)
     num_classes  = cfg.num_classes
     class_names  = get_class_names(num_classes)
+
+    html_manifest: List[dict] = []
+    class_colors = None
+    html_dir = output_dir / "html_report"
+    if args.html_report:
+        class_colors = get_class_colors(num_classes)
+        (html_dir / "images").mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] HTML report enabled -> {html_dir / 'report.html'}")
 
     postprocess_classes = None
     if args.postprocess:
@@ -379,11 +405,46 @@ def main():
         score_path = postproc_path if (args.postprocess and postproc_path.exists()) else raw_pred_path
         pred = sitk.GetArrayFromImage(sitk.ReadImage(str(score_path)))  # [D,H,W]
 
+        if args.html_report:
+            pid_img_dir = html_dir / "images" / pid
+            pid_img_dir.mkdir(parents=True, exist_ok=True)
+
         for z in valid_frames:
-            for row in compare_frame(seg[z], pred[z], num_classes):
+            frame_class_rows = compare_frame(seg[z], pred[z], num_classes)
+            for row in frame_class_rows:
                 row["pullback"]    = pid
                 row["frame_1based"] = z + 1
                 frame_rows.append(row)
+
+            if args.html_report:
+                gt_frame   = seg[z]
+                pred_frame = pred[z]
+
+                # Reuse the per-class dice just computed above -- excl. background,
+                # same "present in GT and/or prediction" convention as aggregate_confusion().
+                dice_vals = [r["dice"] for r in frame_class_rows if r["class_idx"] != 0 and not math.isnan(r["dice"])]
+                frame_dice = float(np.mean(dice_vals)) if dice_vals else float("nan")
+
+                raw_rgb      = np.stack([to_uint8_display(volume[z])] * 3, axis=-1)
+                overlay_gt   = blend_overlay(raw_rgb, colorize(gt_frame, class_colors), gt_frame > 0, args.html_alpha)
+                overlay_pred = blend_overlay(raw_rgb, colorize(pred_frame, class_colors), pred_frame > 0, args.html_alpha)
+
+                frame_1based = z + 1
+                raw_name  = f"frame{frame_1based:04d}_raw.jpg"
+                gt_name   = f"frame{frame_1based:04d}_gt.jpg"
+                pred_name = f"frame{frame_1based:04d}_pred.jpg"
+                save_jpg(raw_rgb,      pid_img_dir / raw_name,  args.html_jpeg_quality)
+                save_jpg(overlay_gt,   pid_img_dir / gt_name,   args.html_jpeg_quality)
+                save_jpg(overlay_pred, pid_img_dir / pred_name, args.html_jpeg_quality)
+
+                html_manifest.append({
+                    "pullback": pid,
+                    "frame":    frame_1based,
+                    "dice":     None if math.isnan(frame_dice) else round(frame_dice, 4),
+                    "raw":      f"images/{pid}/{raw_name}",
+                    "gt":       f"images/{pid}/{gt_name}",
+                    "pred":     f"images/{pid}/{pred_name}",
+                })
 
             if not args.skip_continuous_metrics:
                 gt_frame   = seg[z].astype(np.int16)
@@ -467,6 +528,14 @@ def main():
         print("\n=== Overall continuous plaque-quantification metrics (N = frames with structure in BOTH GT and prediction) ===")
         print(df_continuous_overall[["metric", "N", "MAE", "Bias", "Mean_GT", "Mean_Pred"]]
               .to_string(index=False, float_format=lambda x: "nan" if math.isnan(x) else f"{x:.2f}"))
+
+    if args.html_report:
+        if html_manifest:
+            report_path = html_dir / "report.html"
+            build_html(html_manifest, class_names, class_colors, report_path)
+            print(f"\n[INFO] Wrote HTML QC report: {report_path} ({len(html_manifest)} frames)")
+        else:
+            print("\n[WARN] --html_report was set but no frames were rendered -- nothing to write.")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List
 
 
 @dataclass
@@ -47,8 +47,22 @@ class Config:
     # Loss weights
     dice_weight:          float = 1.0
 
-    # Main loss function: "ce_dice" (cross-entropy + dice) or "mse_onehot" (MSE on one-hot targets).
+    # Main loss function: "ce_dice" (cross-entropy + dice), "tversky_ce" (cross-entropy +
+    # Tversky, a generalisation of dice — see tversky_alpha/beta below), or "mse_onehot"
+    # (MSE on one-hot targets).
     loss_type: str = "mse_onehot"
+    # Tversky index = TP / (TP + alpha*FP + beta*FN). alpha=beta=0.5 (the default) is
+    # mathematically the same formula as dice_loss — only changes behavior once tuned away
+    # from that. alpha > beta penalises false positives more (use for an over-predicted/
+    # oversensitive class); beta > alpha penalises false negatives more (under-predicted).
+    # Only read when loss_type == "tversky_ce".
+    tversky_alpha: float = 0.5
+    tversky_beta:  float = 0.5
+    # Per-class overrides of the above, e.g. {4: 0.7} to raise just Lipid's (class 4) FP
+    # penalty without touching every other class. Missing classes fall back to the global
+    # tversky_alpha/tversky_beta.
+    tversky_class_alpha: Dict[int, float] = field(default_factory=dict)
+    tversky_class_beta:  Dict[int, float] = field(default_factory=dict)
     # 3D temporal smoothness: penalises class-prob changes between consecutive z-frames.
     # Improves pullback consistency. Enable AFTER 2D per-frame quality is satisfactory.
     smoothness_3d_weight: float = 0.0

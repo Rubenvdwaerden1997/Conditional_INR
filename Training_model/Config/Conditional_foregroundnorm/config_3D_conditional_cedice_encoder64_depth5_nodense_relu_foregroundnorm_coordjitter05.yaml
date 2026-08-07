@@ -1,0 +1,117 @@
+# ============================
+# General Settings
+# ============================
+env: "cluster"   #"local" or "cluster"
+training_mode: "3D"   # "2D" trains on annotated frames only; "3D" trains on full volumes
+save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_3D_conditional"
+experiment_name: "conditional_3D_relu_cedice_trilinear_encoder64_depth5_nodense_foregroundnorm_coordjitter05"
+
+seed: 42
+device: "cuda"   # or "cpu"
+
+# ============================
+# Data Settings
+# ============================
+# Combines the two depth5_nodense_relu variants: foreground-only z-score normalized data
+# (see config_..._foregroundnorm.yaml) plus sub-pixel coord jitter at sample time (see
+# config_..._coordjitter05.yaml). patches_folder_3d reuses the SAME foregroundnorm patches
+# folder as the foregroundnorm-only run -- coord_jitter_max is applied by dataset.py's
+# _sample_coords at train time, not during preprocessing, so the prebuilt patch files
+# themselves are identical regardless of this setting.
+paths:
+  local:
+    data_root: ["W:/rubenvdw/Dataset/3D_Grayscale_Circmask_ForegroundZNorm_Dicoms_Segmentations_12classes_31072026"]
+    split_excel: "W:/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "W:/rubenvdw/Conditional_INR/Patches_preprocessed_3D_foregroundnorm"
+  cluster:
+    data_root: ["/data/diag/rubenvdw/Dataset/3D_Grayscale_Circmask_ForegroundZNorm_Dicoms_Segmentations_12classes_31072026"]
+    split_excel: "/data/diag/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "/data/diag/rubenvdw/Conditional_INR/Patches_preprocessed_3D_foregroundnorm"
+train_batch_size: 2
+
+# ============================
+# Model Settings
+# ============================
+model_seg_decoder:
+  out_channels: 12
+  feature_size: 64          # bigger encoder: 64 channels instead of 16 (~150k encoder params vs 11k)
+  use_local_features: True
+  use_dense_decoder: False  # isolates the foreground-norm + coord-jitter combo on the depth5+relu baseline — no auxiliary CNN loss
+  dense_decoder_skip_connections: False   # irrelevant when use_dense_decoder is False
+  encoder_depth: 5          # matches depth5_nodense_relu (current best) — only change vs it is data preprocessing + coord_jitter_max
+  use_intermediate_features: False   # not yet implemented for encoder_depth=5 (INR path unaffected either way)
+  global_feat_ch: 64
+  dilation_xy: 1
+  encoder_z_strides: [1, 1, 2, 1, 1]   # Z downsamples once, centered (at layer3) — matches depth5_nodense_relu
+  feature_sampling: "trilinear"
+  inr_hidden: 128
+  inr_depth: 4
+  inr_activation: "relu"   # Fourier PE + concatenated features -> ReLU MLP, no periodic SIREN/FiLM
+  siren_omega_0: 30.0      # unused when inr_activation="relu"
+  num_freqs_xy: 4
+  num_freqs_z: 4
+  mapping_activated: True
+  mapping:
+    0: 0 # Background
+    1: 1 # Lumen
+    2: 2 # Guidewire
+    3: 3 # Intima
+    4: 4 # Lipid
+    5: 5 # Calcium
+    6: 6 # Media
+    7: 1 # Catheter
+    8: 7 # Sidebranch
+    9: 8 # Red thrombus
+    10: 8 # White thrombus
+    11: 3 # Dissection
+    12: 9 # Plaque rupture
+    13: 10 # Layered plaque
+    14: 11 # Neovascularization
+    15: 3 # Intraplaque hemorrhage
+    16: 3 # Intramural hematoma
+
+# ============================
+# Training Settings
+# ============================
+training_segmentation:
+  epochs: 300
+  warmup_epochs: 5
+  lr_settings:
+    initial_lr: 0.0003
+    weight_decay: 0.0001
+  val_interval: 5
+  ignore_index: 255
+  ignore_background: True
+  feature_supervision: False
+  tv_loss_weight: 0.0
+  smoothness_3d_weight: 0.0
+  smoothness_2d_weight: 0.0
+  smoothness_2d_n_pairs: 1024
+  smoothness_class_indices: [0,1,3,4,5,6,7,10]
+  # Sub-pixel coordinate jitter (2026-07-31, new addition on top of the depth5_nodense_relu
+  # baseline). At train time, offsets each sampled query point's (x, y) by a fresh uniform
+  # draw from [-0.5, +0.5] px -- the full pixel footprint, every position inside the pixel
+  # equally likely. z untouched. The pixel's own hard label is kept unchanged regardless of
+  # the offset (no soft/blended labels) -- this densifies hard-label supervision right up to
+  # class boundaries instead of leaving the gap between adjacent pixels' single point-samples
+  # totally unconstrained, which is where the FiLM-SIREN/ReLU-MLP decoder's phantom-blob and
+  # salt-and-pepper pixelation has consistently shown up across every prior experiment in this
+  # series. See [[project_conditional_inr]] for the full reasoning and the decoder-robustness
+  # experiments (relu swap, radial prior, foreground normalization) this is meant to complement.
+  # Validation always uses exact pixel centers regardless of this setting (dataset.py's
+  # _sample_coords only jitters when mode=="train"), so Val Dice stays directly comparable
+  # to every prior run in the table.
+  coord_jitter_max: 0.5
+  patch_z: 16
+  resize_to: 512
+  sampling_strategy: "random"
+  background_floor_frac: 0.0
+  n_points: 524288
+  preload_data: False
+  preload_frac: 0.3
+  use_amp: False
+  grad_clip_norm: 0.0   # matches the depth5_nodense_relu baseline exactly — clean single-variable comparison
+  loss_type: "ce_dice"
+  dense_decoder_weight: 1.0   # unused when use_dense_decoder is False
+  max_batches_frac: 0.25
+  val_interval_pct: 0.05

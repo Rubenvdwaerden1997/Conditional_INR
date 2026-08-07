@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +31,56 @@ def dice_loss(
     exclude = {ignore_index, *(([0] if ignore_background else []))}
     fg_classes = [c for c in range(num_classes) if c not in exclude]
     return dice_per_class[fg_classes].mean()
+
+
+def tversky_loss(
+    logits: torch.Tensor,    # [M, C]  already filtered to valid points
+    targets: torch.Tensor,   # [M]
+    num_classes: int,
+    ignore_index: int = 255,
+    ignore_background: bool = False,
+    alpha: float = 0.5,
+    beta: float = 0.5,
+    class_alpha: Optional[Dict[int, float]] = None,
+    class_beta: Optional[Dict[int, float]] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Generalises dice_loss: Tversky index = TP / (TP + alpha*FP + beta*FN).
+
+    alpha=beta=0.5 is the same formula as dice_loss (up to eps, which only matters at
+    the zero-count edge case, not on real batches) -- this is a drop-in superset, not a
+    different loss family. alpha > beta penalises false positives more (use for an
+    over-predicted/oversensitive class, e.g. Lipid); beta > alpha penalises false
+    negatives more. class_alpha/class_beta override the global alpha/beta per class
+    (e.g. {4: 0.7} to raise only Lipid's FP penalty) so the rest of the loss for every
+    other class is left exactly as it was.
+    """
+    valid = targets != ignore_index
+    if not valid.any():
+        return torch.tensor(0.0, device=logits.device)
+
+    logits  = logits[valid]
+    targets = targets[valid]
+
+    probs   = torch.softmax(logits, dim=-1)            # [M, C]
+    one_hot = F.one_hot(targets, num_classes).float()  # [M, C]
+
+    tp = (probs * one_hot).sum(dim=0)              # [C]
+    fp = (probs * (1 - one_hot)).sum(dim=0)         # [C]
+    fn = ((1 - probs) * one_hot).sum(dim=0)         # [C]
+
+    alphas = torch.full((num_classes,), alpha, device=logits.device)
+    betas  = torch.full((num_classes,), beta, device=logits.device)
+    for c, a in (class_alpha or {}).items():
+        alphas[c] = a
+    for c, b in (class_beta or {}).items():
+        betas[c] = b
+
+    tversky_per_class = 1 - (tp + eps) / (tp + alphas * fp + betas * fn + eps)
+
+    exclude = {ignore_index, *(([0] if ignore_background else []))}
+    fg_classes = [c for c in range(num_classes) if c not in exclude]
+    return tversky_per_class[fg_classes].mean()
 
 
 def smoothness_3d_loss(
@@ -136,6 +186,13 @@ def compute_loss(
     if cfg.loss_type == "mse_onehot":
         total = mse_onehot_loss(flat_logits, flat_labels, C, cfg.ignore_index)
         log   = {"mse_onehot": total.item()}
+    elif cfg.loss_type == "tversky_ce":
+        ce    = F.cross_entropy(flat_logits[valid], flat_labels[valid])
+        tl    = tversky_loss(flat_logits, flat_labels, C, cfg.ignore_index, cfg.ignore_background,
+                              cfg.tversky_alpha, cfg.tversky_beta,
+                              cfg.tversky_class_alpha, cfg.tversky_class_beta)
+        total = ce + cfg.dice_weight * tl
+        log   = {"ce": ce.item(), "tversky": tl.item()}
     else:
         ce    = F.cross_entropy(flat_logits[valid], flat_labels[valid])
         dl    = dice_loss(flat_logits, flat_labels, C, cfg.ignore_index, cfg.ignore_background)
