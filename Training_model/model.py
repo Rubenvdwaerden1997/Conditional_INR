@@ -53,7 +53,9 @@ def resize_labels(x: torch.Tensor, size: int) -> torch.Tensor:
 
 def normalize_coords_3d(
     coords: torch.Tensor,        # [..., 3]  (x, y, z) voxel indices
-    volume_shape: tuple,         # (D, H, W)
+    volume_shape: tuple,         # (D, H, W)  — H, W of the grid coords are indexed in;
+                                  # need not match the encoder input's own resolution
+                                  # (see query_shape in ConditionalINR.forward).
     cfg: Config,
 ) -> torch.Tensor:               # [..., 3]  physically-proportional normalised coords
     """Normalise voxel coords to physically-proportional space for the PE.
@@ -65,11 +67,22 @@ def normalize_coords_3d(
 
     Example — 512×512×32 with xy_spacing=0.01 mm, z_spacing=0.10 mm:
         z_ratio = (32 × 0.10) / (512 × 0.01) = 3.2 / 5.12 ≈ 0.625
+
+    cfg.xy_spacing is mm/px at cfg.resize_to resolution (or native_xy_size if
+    resize_to=0 — see Config.__post_init__). volume_shape's W need not equal
+    that reference resolution (e.g. coords queried at native 704 while the
+    encoder was fed a 256 input): xy_spacing is rescaled to W here so the
+    physical half-extent (and therefore z_ratio) stays identical regardless
+    of which grid W the caller's coords happen to be indexed in. When
+    W == ref_w (the only case that existed before this), this is a no-op —
+    existing single-resolution experiments are unaffected.
     """
-    D, H, W    = volume_shape
+    D, H, W        = volume_shape
+    ref_w          = cfg.resize_to if cfg.resize_to else cfg.native_xy_size
+    norm_scale     = (ref_w - 1) * cfg.xy_spacing / 2.0   # physical half-extent (mm), resolution-invariant
+    xy_spacing_at_w = cfg.xy_spacing * ref_w / W          # mm/px at this call's W
     center     = coords.new_tensor([(W - 1) / 2.0, (H - 1) / 2.0, (D - 1) / 2.0])
-    spacing    = coords.new_tensor([cfg.xy_spacing, cfg.xy_spacing, cfg.z_spacing])
-    norm_scale = (W - 1) * cfg.xy_spacing / 2.0
+    spacing    = coords.new_tensor([xy_spacing_at_w, xy_spacing_at_w, cfg.z_spacing])
     return (coords - center) * spacing / norm_scale
 
 
@@ -879,8 +892,13 @@ class ConditionalINR(nn.Module):
         volume: torch.Tensor,            # [B, 1, D, H, W]
         coords: torch.Tensor,            # [B, N, 3]  voxel space (x, y, z)
         return_feat_logits: bool = False,
+        query_shape: Optional[Tuple[int, int, int]] = None,   # (D, H, W) coords are indexed in;
+                                                                # defaults to volume.shape (old behaviour).
+                                                                # Pass a larger (H, W) to query the INR at a
+                                                                # finer grid than the encoder was fed (e.g.
+                                                                # encoder sees 256, coords queried at native 704).
     ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
-        D, H, W = volume.shape[2], volume.shape[3], volume.shape[4]
+        D, H, W = query_shape if query_shape is not None else volume.shape[2:]
         if self.use_multiscale:
             if self.cfg.encoder_depth == 5:
                 feat_vol, global_feat, layer1, layer2, layer3, layer4 = self.encoder.forward_deep_multiscale(volume)

@@ -23,11 +23,17 @@ echo "Running on node: $(hostname)"
 MODEL_DIR="/data/diag/rubenvdw/Conditional_INR/saved_models_3D_conditional/conditional_3D_relu_cedice_trilinear_encoder64_depth5_nodense_foregroundnorm"
 OVERLAP=0.5              # must match the --overlap used when Pullback_prediction.py made the predictions
 USE_POSTPROCESSED=true   # true -> prefer *_postprocessed.nii.gz predictions when present
+EVAL_RESOLUTION=encoder  # must match the --eval_resolution Pullback_prediction.py made these predictions
+                         # with: "native" (default) or "encoder" (scores at cfg.resize_to instead of
+                         # native -- see Pullback_prediction.py --help). Output lands in its own
+                         # "_encoderres"-suffixed folder + differently-named report.html, so switching
+                         # this never overwrites the other mode's report.
 
 ARGS=(
-    --model_dir "$MODEL_DIR"
-    --env       cluster
-    --overlap   "$OVERLAP"
+    --model_dir       "$MODEL_DIR"
+    --env             cluster
+    --overlap         "$OVERLAP"
+    --eval_resolution "$EVAL_RESOLUTION"
 )
 if [ "$USE_POSTPROCESSED" = true ]; then
     ARGS+=(--use_postprocessed)

@@ -73,6 +73,7 @@ def build_config(yml: dict) -> Config:
         radial_prior_n_radii          = tr.get("radial_prior_n_radii", 12),
         background_floor_frac       = tr.get("background_floor_frac", 0.0),
         coord_jitter_max            = tr.get("coord_jitter_max", 0.0),
+        difficulty_lambda           = tr.get("difficulty_lambda", 0.5),
         n_points                    = tr.get("n_points", 8192),
         num_freqs_xy                = seg.get("num_freqs_xy", 6),
         num_freqs_z                 = seg.get("num_freqs_z", 4),

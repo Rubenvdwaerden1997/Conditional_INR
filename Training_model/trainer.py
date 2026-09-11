@@ -18,7 +18,7 @@ from config import Config
 from dataset import OCTPullbackDataset
 from inference import predict_frame_unconditional, predict_pullback, predict_pullback_unconditional
 from losses import compute_loss, dice_loss
-from model import ConditionalINR, UnconditionalINR
+from model import ConditionalINR, UnconditionalINR, resize_volume
 from utils import save_training_plots, setup_output_dir
 
 
@@ -154,17 +154,26 @@ def _save_vis_predictions(
         pred_dense = None
         if entry.get("prebuilt_3d"):
             data        = np.load(entry["file"], allow_pickle=False)
-            patch       = data["patch"].astype(np.float32)   # [patch_z, H, W]
+            patch       = data["patch"].astype(np.float32)   # [patch_z, H, W] — native resolution
             z_local     = int(data["z_local"])
             gt_label    = data["labels"][z_local].astype(np.int64)  # [H, W]  already remapped
             img         = patch[z_local]
-            pred_patch  = predict_pullback(model, patch, cfg, device)
+            # Prebuilt .npz patches are stored at native resolution, but the encoder was
+            # trained on cfg.resize_to input (dataset.py's _resize_xy_labels resizes every
+            # patch before it reaches the model). Feeding the raw native patch straight into
+            # predict_pullback here mismatches the encoder's trained input scale — mirror the
+            # dataset's resize step, then query the INR back at native resolution (query_hw)
+            # so the visualisation is still full-detail. No-op when cfg.resize_to == 0.
+            native_hw     = patch.shape[-1]
+            encoder_input = resize_volume(torch.from_numpy(patch), cfg.resize_to).numpy() if cfg.resize_to else patch
+            pred_patch    = predict_pullback(model, encoder_input, cfg, device,
+                                              query_hw=native_hw if cfg.resize_to else None)
             pred        = pred_patch[z_local]
             tag         = os.path.splitext(os.path.basename(entry["file"]))[0]
 
             if cfg.use_dense_decoder and model.dense_decoder is not None:
                 with torch.no_grad():
-                    vol_t = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float().to(device)
+                    vol_t = torch.from_numpy(encoder_input).unsqueeze(0).unsqueeze(0).float().to(device)
                     if cfg.dense_decoder_skip_connections and cfg.encoder_depth == 5:
                         fv, _, l1, l2, l3, l4 = model.encoder.forward_deep_multiscale(vol_t)
                         d_logits = model.dense_decoder(fv, layer1=l1, layer2=l2, layer3=l3, layer4=l4)
@@ -184,7 +193,13 @@ def _save_vis_predictions(
             vol  = data["Volume_input_image"]
             if vol.ndim == 4:
                 vol = vol[0]
-            pred_vol = predict_pullback(model, vol.astype(np.float32), cfg, device)
+            vol = vol.astype(np.float32)   # native resolution
+            # Same resize-to-cfg.resize_to / query-at-native-resolution fix as the
+            # prebuilt_3d branch above — see comment there.
+            native_hw     = vol.shape[-1]
+            encoder_input = resize_volume(torch.from_numpy(vol), cfg.resize_to).numpy() if cfg.resize_to else vol
+            pred_vol      = predict_pullback(model, encoder_input, cfg, device,
+                                              query_hw=native_hw if cfg.resize_to else None)
             ann      = entry["annotated_frames"]
             z        = ann[len(ann) // 2]       # middle annotated frame
             img      = vol[z]
@@ -630,6 +645,29 @@ def train_one_epoch(
     return avg_loss, avg_log
 
 
+def compute_difficulty_weights(
+    dice_per_class: List[float],
+    num_classes:    int,
+) -> np.ndarray:
+    """weight_c = 1 - dice_c for foreground classes with a valid validation Dice;
+    background (index 0) and any class absent from this validation pass keep a flat
+    weight of 1.0 (neither starved nor boosted).
+
+    This is only the class-level (dice-derived) half of the difficulty score.
+    The other half — boundary closeness — is computed per pixel, live, on each
+    training patch's own ground truth in dataset.py's _weighted_sample, since
+    "distance to this pixel's own class boundary" is meaningless as a single
+    validation-set-wide class constant: it has to vary pixel by pixel, even
+    within the same class, to do anything a flat per-class multiplier can't.
+    """
+    weights = np.ones(num_classes, dtype=np.float64)
+    for c in range(1, num_classes):
+        dice = dice_per_class[c]
+        if not math.isnan(dice):
+            weights[c] = 1.0 - dice
+    return weights
+
+
 @torch.no_grad()
 def validate(
     model: ConditionalINR,
@@ -885,6 +923,17 @@ def train(
             history["val_dice_per_class"].append(val_dice_per_class)
 
             log_str += f" | Val loss: {val_loss:.4f} | Val Dice: {val_dice:.4f}"
+
+            if cfg.sampling_strategy == "difficulty_weighted":
+                new_weights = compute_difficulty_weights(val_dice_per_class, cfg.num_classes)
+                train_ds.update_class_sample_weights(new_weights)
+                logger.info(
+                    "Difficulty-weighted sampling weights updated: "
+                    + ", ".join(
+                        f"{_ITKSNAP_LABELS[c] if c < len(_ITKSNAP_LABELS) else c}={new_weights[c]:.3f}"
+                        for c in range(1, cfg.num_classes)
+                    )
+                )
 
             if val_dice > best_dice:
                 best_dice = val_dice

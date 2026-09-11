@@ -122,8 +122,18 @@ def predict_pullback_decoder(
 
 
 def save_nii(arr: np.ndarray, path: Path, cfg: Config) -> None:
-    img = sitk.GetImageFromArray(arr.astype(np.int16))
-    img.SetSpacing([cfg.xy_spacing, cfg.xy_spacing, cfg.z_spacing])
+    """Save arr as .nii.gz with xy spacing rescaled to arr's own (H, W).
+
+    cfg.xy_spacing is mm/px at cfg.resize_to (or native_xy_size if 0) — arr may
+    be at a different resolution (e.g. --query_resolution), so spacing is
+    rescaled here rather than assumed equal to cfg.xy_spacing. When arr's W
+    equals that reference resolution (the only case before --query_resolution
+    existed), this is a no-op.
+    """
+    img   = sitk.GetImageFromArray(arr.astype(np.int16))
+    ref_w = cfg.resize_to if cfg.resize_to else cfg.native_xy_size
+    xy_spacing_out = cfg.xy_spacing * ref_w / arr.shape[-1]
+    img.SetSpacing([xy_spacing_out, xy_spacing_out, cfg.z_spacing])
     sitk.WriteImage(img, str(path))
     print(f"Saved → {path}")
 
@@ -139,6 +149,12 @@ def main():
                         help="Patch overlap fraction [0.0–1.0]. "
                              "0.0 = no overlap (default), 0.5 = 50%% overlap, "
                              "1.0 = stride of 1 frame (maximum overlap).")
+    parser.add_argument("--query_resolution", default=None, type=int,
+                        help="Query the INR on a (query_resolution, query_resolution) coordinate "
+                             "grid instead of the encoder input's own resolution (cfg.resize_to). "
+                             "Lets a model trained with a small resize_to (e.g. 256) predict at a "
+                             "finer grid (e.g. 704, the native resolution). Omit to keep old "
+                             "behaviour unchanged — output resolution equal to cfg.resize_to.")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -188,8 +204,10 @@ def main():
     print(f"Saved → {input_path}")
 
     # --- INR prediction ---
-    print(f"Running INR inference (overlap_frac={args.overlap})...")
-    pred_inr = predict_pullback(model, volume, cfg, device, overlap_frac=args.overlap)
+    query_note = f", query_resolution={args.query_resolution}" if args.query_resolution else ""
+    print(f"Running INR inference (overlap_frac={args.overlap}{query_note})...")
+    pred_inr = predict_pullback(model, volume, cfg, device, overlap_frac=args.overlap,
+                                 query_hw=args.query_resolution)
     save_nii(pred_inr, out_base, cfg)
 
     # --- Dense decoder prediction (if available) ---

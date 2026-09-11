@@ -176,11 +176,32 @@ class Config:
     patch_z: int = 32
 
     # Coordinate sampling strategy during training.
-    # "random"     — uniform random draw from labeled pixels (70 %) + random (30 %)
-    # "stratified" — labeled budget split equally across present classes, so rare
-    #                classes (calcium, thrombus, …) get the same representation as
-    #                dominant ones (lumen, intima, background).
+    # "random"             — uniform random draw from labeled pixels (70 %) + random (30 %)
+    # "stratified"         — labeled budget split equally across present classes, so rare
+    #                        classes (calcium, thrombus, …) get the same representation as
+    #                        dominant ones (lumen, intima, background).
+    # "difficulty_weighted" — labeled pixels are drawn with a genuinely per-pixel
+    #                        probability (not a per-class quota): for a candidate pixel
+    #                        of class c,
+    #                            weight = lambda * boundary_closeness(this pixel)
+    #                                     + (1-lambda) * (1 - dice_c)
+    #                        boundary_closeness is computed LIVE on this training patch's
+    #                        own ground truth (distance to class c's own boundary in THIS
+    #                        patch, so it varies pixel by pixel even within one class — a
+    #                        pixel on c's edge scores near 1, deep interior scores near 0).
+    #                        dice_c is c's validation Dice, refreshed every validation pass
+    #                        (a real curriculum signal — it moves as the model improves) and
+    #                        broadcast to every pixel of that class, since Dice only exists
+    #                        per class. Background (class 0) always gets a flat weight of
+    #                        1.0 — excluded from both terms, so it's neither starved nor
+    #                        boosted by other classes' difficulty.
     sampling_strategy: str = "stratified"
+
+    # difficulty_weighted only: blend weight between the two per-pixel terms above.
+    # 0.0 = pure inverse-Dice curriculum (every pixel of a class weighted equally,
+    # only which class matters). 1.0 = pure boundary-proximity (edge pixels of every
+    # class favored over interior pixels, dice ignored).
+    difficulty_lambda: float = 0.5
 
     # Pre-load patch .npz files into RAM at dataset init to avoid disk I/O
     # during training. Requires enough system RAM (request ~1.5× dataset size).

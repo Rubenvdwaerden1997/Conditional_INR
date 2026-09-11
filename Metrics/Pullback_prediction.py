@@ -11,8 +11,14 @@ Given a model folder (best_model.pt/latest.pt + its yaml config), this script:
      segmentation labels with the config's class mapping (same remap used at
      training time), and predicts the full pullback via
      Pipeline_ConditionalINR.conditional_inr_inference.predict_conditionalinr
-     (reused as-is -- same resize/inference/upsample path as the batch
-     pipeline, not duplicated here).
+     (reused as-is -- same resize/inference path as the batch pipeline, not
+     duplicated here). --eval_resolution controls what grid this happens on:
+     "native" (default) scores against full native-resolution ground truth,
+     querying the INR at native resolution; "encoder" instead scores at the
+     model's own encoder input resolution (cfg.resize_to), downsampling the
+     ground truth to match (nearest-neighbour) rather than querying the INR
+     at native resolution -- isolates the model's own learned segmentation
+     quality from any effect of the native-resolution query-time decoupling.
   3. At every annotated frame only (the sole ground truth available), compares
      prediction vs. ground truth per class:
        - frame-level presence counts (TP/FP/FN/TN, i.e. does the class appear
@@ -42,7 +48,8 @@ Usage:
         [--postprocess] \
         [--output_dir /path/to/output] \
         [--env local|cluster] \
-        [--max_pullbacks 3]
+        [--max_pullbacks 3] \
+        [--eval_resolution native|encoder]
 """
 import argparse
 import math
@@ -55,6 +62,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
+import torch
 import yaml
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -70,6 +78,9 @@ sys.path.insert(0, REPO_ROOT)
 
 from conditional_inr_inference import load_conditional_inr_model, predict_conditionalinr
 from postprocessing_conditionalinr import load_classes_pixels
+# Training_model is already on sys.path as a side effect of the conditional_inr_inference
+# import above (it inserts its own dual local/cluster Training_model path).
+from model import resize_labels, resize_volume
 
 # Same dual local/cluster sys.path insertion pattern as
 # Teacher_student/Codes/Predict/Predict_Evaluate_dict_onefold.py -- whichever
@@ -281,6 +292,15 @@ def main():
     parser.add_argument("--chunk_size",  type=int, default=65536, help="Voxels per INR forward pass")
     parser.add_argument("--use_amp",     action="store_true", help="Encoder-only bfloat16 autocast")
     parser.add_argument("--device",      type=str, default="cuda")
+    parser.add_argument("--eval_resolution", type=str, default="native", choices=["native", "encoder"],
+                         help="'native' (default): score against the full native-resolution ground truth, "
+                              "querying the INR at native resolution (current deployment behaviour, unchanged). "
+                              "'encoder': score at the model's own encoder input resolution (cfg.resize_to) "
+                              "instead -- the INR is queried on that smaller grid (no native-resolution "
+                              "query-time decoupling), and the ground truth is nearest-neighbour-downsampled "
+                              "to match before comparison. Isolates the model's own learned segmentation "
+                              "quality from any effect of querying at native resolution. No-op (same as "
+                              "'native') when cfg.resize_to == 0, since there's nothing to downsample to.")
     parser.add_argument("--postprocess", action="store_true", help="Apply small-region cleanup before scoring")
     parser.add_argument("--postprocess_config", type=str, default=_DEFAULT_POSTPROCESS_CONFIG)
     parser.add_argument("--postprocess_n_procs", type=int, default=4)
@@ -312,8 +332,11 @@ def main():
 
     # Default folder name encodes --overlap (0.5 -> "test_metrics_05", 1.0 -> "test_metrics_10")
     # so different overlap runs land in separate folders instead of overwriting each other.
+    # Same reasoning for --eval_resolution: "encoder" gets its own "_encoderres" suffix so it
+    # never overwrites (or is overwritten by) a default "native" run of the same model/overlap.
     overlap_suffix = str(args.overlap).replace(".", "")
-    output_dir = Path(args.output_dir) if args.output_dir else model_dir / f"test_metrics_{overlap_suffix}"
+    eval_suffix    = "_encoderres" if args.eval_resolution == "encoder" else ""
+    output_dir = Path(args.output_dir) if args.output_dir else model_dir / f"test_metrics_{overlap_suffix}{eval_suffix}"
     pred_dir   = output_dir / "predictions"
     output_dir.mkdir(parents=True, exist_ok=True)
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -334,10 +357,14 @@ def main():
     html_manifest: List[dict] = []
     class_colors = None
     html_dir = output_dir / "html_report"
+    # output_dir already encodes --eval_resolution via its own "_encoderres" folder suffix
+    # (see above), so native vs. encoder runs never share a folder -- this filename split
+    # is a second, independent safeguard against the two ever overwriting each other.
+    report_name = "report.html" if args.eval_resolution == "native" else f"report_{args.eval_resolution}res.html"
     if args.html_report:
         class_colors = get_class_colors(num_classes)
         (html_dir / "images").mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] HTML report enabled -> {html_dir / 'report.html'}")
+        print(f"[INFO] HTML report enabled -> {html_dir / report_name}")
 
     postprocess_classes = None
     if args.postprocess:
@@ -347,13 +374,19 @@ def main():
     # plaque_quantification.py's font param only accepts 'mine' (hardcoded Windows path)
     # or 'cluster' (hardcoded /data/diag path) -- derive from the same env this run uses.
     quant_font = "mine" if yml["env"] == "local" else "cluster"
-    # Native-resolution pixel spacing (mm/px), recovered the same way
-    # predict_conditionalinr() computes it for the saved .nii.gz spacing metadata --
-    # both seg[z] and pred[z] are always native-resolution arrays (see module docstring).
-    native_xy_spacing = cfg.xy_spacing * (cfg.resize_to / cfg.native_xy_size) if cfg.resize_to else cfg.xy_spacing
+    # Pixel spacing (mm/px) for whichever grid this run actually scores on -- must match
+    # predict_conditionalinr()'s own out_xy_spacing computation for the same eval_resolution,
+    # since both seg_eval[z] and pred[z] below live on that same grid (native, or cfg.resize_to
+    # when --eval_resolution=encoder), never native alone regardless of mode.
+    if args.eval_resolution == "encoder":
+        eval_xy_spacing = cfg.xy_spacing   # already the correct spacing for the resize_to (or native) grid
+    else:
+        eval_xy_spacing = cfg.xy_spacing * (cfg.resize_to / cfg.native_xy_size) if cfg.resize_to else cfg.xy_spacing
+    print(f"[INFO] eval_resolution={args.eval_resolution} "
+          f"({'encoder input res, cfg.resize_to=' + str(cfg.resize_to) if args.eval_resolution == 'encoder' else 'native'})")
     if not args.skip_continuous_metrics:
         print(f"[INFO] Continuous metrics enabled (label_file={args.label_file}, font={quant_font}, "
-              f"xy_spacing={native_xy_spacing:.6f} mm/px) -- adds runtime per frame with lipid/calcium present")
+              f"xy_spacing={eval_xy_spacing:.6f} mm/px) -- adds runtime per frame with lipid/calcium present")
 
     frame_rows: List[dict] = []
     continuous_rows: List[dict] = []
@@ -382,6 +415,22 @@ def main():
         if label_mapping:
             seg = remap_labels(seg, label_mapping)
 
+        # For --eval_resolution=encoder, score against ground truth downsampled to the
+        # model's own cfg.resize_to grid instead of native -- nearest-neighbour, via the
+        # same resize_labels() training/validate() already use, so class boundaries stay
+        # crisp instead of being blended into invented intermediate labels. volume_eval
+        # is only needed so the HTML report's raw-image panel matches gt/pred in shape
+        # (bilinear, same as resize_volume() everywhere else in this codebase).
+        # No-op (seg_eval is seg, volume_eval is volume) for the default "native" mode,
+        # and also a no-op when cfg.resize_to == 0 (e.g. the native704 model) since
+        # there's nothing to downsample to.
+        if args.eval_resolution == "encoder" and cfg.resize_to:
+            seg_eval    = resize_labels(torch.from_numpy(seg), cfg.resize_to).numpy()
+            volume_eval = resize_volume(torch.from_numpy(volume), cfg.resize_to).numpy()
+        else:
+            seg_eval    = seg
+            volume_eval = volume
+
         D = volume.shape[0]
         valid_frames = [z for z in ann_frames if 0 <= z < D]
         skipped = sorted(set(ann_frames) - set(valid_frames))
@@ -400,24 +449,31 @@ def main():
             postprocess_classes=postprocess_classes,
             postprocess_output_path=str(postproc_path) if postprocess_classes is not None else None,
             postprocess_n_procs=args.postprocess_n_procs,
+            eval_resolution=args.eval_resolution,
         )
 
         score_path = postproc_path if (args.postprocess and postproc_path.exists()) else raw_pred_path
         pred = sitk.GetArrayFromImage(sitk.ReadImage(str(score_path)))  # [D,H,W]
+        assert pred.shape[1:] == seg_eval.shape[1:], (
+            f"{pid}: pred grid {pred.shape[1:]} != ground-truth grid {seg_eval.shape[1:]} "
+            f"(eval_resolution={args.eval_resolution}, cfg.resize_to={cfg.resize_to}) -- "
+            "predict_conditionalinr's eval_resolution handling and this script's ground-truth "
+            "downsampling have gone out of sync, would silently corrupt every Dice number."
+        )
 
         if args.html_report:
             pid_img_dir = html_dir / "images" / pid
             pid_img_dir.mkdir(parents=True, exist_ok=True)
 
         for z in valid_frames:
-            frame_class_rows = compare_frame(seg[z], pred[z], num_classes)
+            frame_class_rows = compare_frame(seg_eval[z], pred[z], num_classes)
             for row in frame_class_rows:
                 row["pullback"]    = pid
                 row["frame_1based"] = z + 1
                 frame_rows.append(row)
 
             if args.html_report:
-                gt_frame   = seg[z]
+                gt_frame   = seg_eval[z]
                 pred_frame = pred[z]
 
                 # Reuse the per-class dice just computed above -- excl. background,
@@ -425,7 +481,7 @@ def main():
                 dice_vals = [r["dice"] for r in frame_class_rows if r["class_idx"] != 0 and not math.isnan(r["dice"])]
                 frame_dice = float(np.mean(dice_vals)) if dice_vals else float("nan")
 
-                raw_rgb      = np.stack([to_uint8_display(volume[z])] * 3, axis=-1)
+                raw_rgb      = np.stack([to_uint8_display(volume_eval[z])] * 3, axis=-1)
                 overlay_gt   = blend_overlay(raw_rgb, colorize(gt_frame, class_colors), gt_frame > 0, args.html_alpha)
                 overlay_pred = blend_overlay(raw_rgb, colorize(pred_frame, class_colors), pred_frame > 0, args.html_alpha)
 
@@ -447,19 +503,19 @@ def main():
                 })
 
             if not args.skip_continuous_metrics:
-                gt_frame   = seg[z].astype(np.int16)
+                gt_frame   = seg_eval[z].astype(np.int16)
                 pred_frame = pred[z].astype(np.int16)
                 _, _, gt_fct,   gt_lipid_arc,   _ = quantification_lipid(
-                    gt_frame, label_file=args.label_file, xy_spacing=native_xy_spacing,
+                    gt_frame, label_file=args.label_file, xy_spacing=eval_xy_spacing,
                     font=quant_font, filename=f"{pid}_frame{z + 1:04d}_gt")
                 _, _, pred_fct, pred_lipid_arc, _ = quantification_lipid(
-                    pred_frame, label_file=args.label_file, xy_spacing=native_xy_spacing,
+                    pred_frame, label_file=args.label_file, xy_spacing=eval_xy_spacing,
                     font=quant_font, filename=f"{pid}_frame{z + 1:04d}_pred")
                 _, _, gt_ca_depth,   gt_ca_arc,   gt_ca_thick,   _ = quantification_calcium(
-                    gt_frame, label_file=args.label_file, xy_spacing=native_xy_spacing,
+                    gt_frame, label_file=args.label_file, xy_spacing=eval_xy_spacing,
                     font=quant_font, filename=f"{pid}_frame{z + 1:04d}_gt")
                 _, _, pred_ca_depth, pred_ca_arc, pred_ca_thick, _ = quantification_calcium(
-                    pred_frame, label_file=args.label_file, xy_spacing=native_xy_spacing,
+                    pred_frame, label_file=args.label_file, xy_spacing=eval_xy_spacing,
                     font=quant_font, filename=f"{pid}_frame{z + 1:04d}_pred")
                 continuous_rows.append({
                     "pullback": pid, "frame_1based": z + 1,
@@ -531,7 +587,7 @@ def main():
 
     if args.html_report:
         if html_manifest:
-            report_path = html_dir / "report.html"
+            report_path = html_dir / report_name
             build_html(html_manifest, class_names, class_colors, report_path)
             print(f"\n[INFO] Wrote HTML QC report: {report_path} ({len(html_manifest)} frames)")
         else:

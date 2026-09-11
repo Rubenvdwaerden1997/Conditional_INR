@@ -6,12 +6,14 @@ old training pipeline). All other frames are masked with ignore_index=255 so
 the loss function skips them automatically.
 """
 
+import math
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import torch
+from scipy.ndimage import distance_transform_edt
 from scipy.ndimage import rotate as nd_rotate
 from torch.utils.data import Dataset
 
@@ -69,6 +71,14 @@ class OCTPullbackDataset(Dataset):
         self.augment           = augment and (mode == "train")
         self.label_mapping     = label_mapping if label_mapping is not None else _DEFAULT_LABEL_MAPPING
         self.mapping_activated = mapping_activated
+
+        # difficulty_weighted sampling: per-class weights, updated in-place from the main
+        # process after each validation pass. Must live in shared memory so the update is
+        # visible to persistent DataLoader worker processes, which otherwise hold their own
+        # forked copy of this dataset object and would never see plain attribute writes.
+        # Flat/neutral at init (equivalent to uniform "stratified" until the first update);
+        # index 0 (background) is never written by the update, by design — see config.py.
+        self.class_sample_weights = torch.ones(cfg.num_classes, dtype=torch.float32).share_memory_()
 
         self._file_cache: Dict[str, Dict] = {}
         if cfg.preload_data and mode == "train":
@@ -486,8 +496,12 @@ class OCTPullbackDataset(Dataset):
         return volume, labels
 
     def _stratified_sample(self, indices: np.ndarray, label_vals: np.ndarray,
-                           n: int) -> np.ndarray:
-        """Sample n indices equally distributed across unique classes in label_vals."""
+                           n: int, labels: Optional[np.ndarray] = None) -> np.ndarray:
+        """Sample n indices equally distributed across unique classes in label_vals.
+
+        labels is accepted-and-ignored so this shares a call signature with
+        _weighted_sample (see _stratified_sample_with_bg_floor's inner_fn dispatch).
+        """
         classes   = np.unique(label_vals)
         n_per_cls = max(1, n // len(classes))
         chosen    = []
@@ -498,24 +512,90 @@ class OCTPullbackDataset(Dataset):
         # Trim to exactly n (rounding may overshoot by at most n_classes-1)
         return result[:n]
 
+    def _weighted_sample(self, indices: np.ndarray, label_vals: np.ndarray,
+                         n: int, labels: Optional[np.ndarray] = None) -> np.ndarray:
+        """Per-pixel weighted sample — the actual difficulty_weighted mechanism.
+
+        indices is [K, 3] (z, y, x) — same convention as _sample_coords' labeled_zyx.
+        Per candidate pixel:
+            weight = lambda * boundary_closeness(this pixel, live, this patch's own
+                     ground truth) + (1 - lambda) * (1 - validation Dice for its class)
+        boundary_closeness varies per pixel even within one class (a pixel right on
+        class c's edge scores near 1, a pixel deep in c's interior scores near 0) —
+        that's the whole point versus a flat per-class multiplier. The dice term is
+        necessarily per-class (dice doesn't exist per-pixel) and just broadcasts the
+        same value to every pixel of that class.
+
+        Background (class 0) always gets a flat weight of 1.0 — excluded from both
+        components (see config.py's difficulty_lambda comment). If labels is None
+        (shouldn't happen from _sample_coords, but kept safe), every class falls back
+        to dice-only weighting (no live boundary term).
+        """
+        lam     = self.cfg.difficulty_lambda
+        weights = np.ones(len(indices), dtype=np.float64)
+
+        for z in np.unique(indices[:, 0]):
+            z_rows = indices[:, 0] == z
+            frame  = labels[z] if labels is not None else None
+            if frame is not None:
+                H, W = frame.shape
+                norm = math.hypot(H, W) / 2.0
+            for c in np.unique(label_vals[z_rows]):
+                if c == 0:
+                    continue   # background: stays at the flat default weight of 1.0
+                cls_rows = z_rows & (label_vals == c)
+                inv_dice = (
+                    float(self.class_sample_weights[c])
+                    if c < len(self.class_sample_weights) else 1.0
+                )
+                if frame is not None:
+                    mask = frame == c
+                    dist = distance_transform_edt(mask)
+                    ys   = indices[cls_rows, 1].astype(np.int64)
+                    xs   = indices[cls_rows, 2].astype(np.int64)
+                    closeness = 1.0 - np.clip(dist[ys, xs] / norm, 0.0, 1.0)
+                    weights[cls_rows] = lam * closeness + (1.0 - lam) * inv_dice
+                else:
+                    weights[cls_rows] = inv_dice
+
+        if weights.sum() <= 0:
+            weights = np.ones_like(weights)
+        probs = weights / weights.sum()
+        chosen_pos = np.random.choice(len(indices), size=n, replace=True, p=probs)
+        return indices[chosen_pos]
+
+    def update_class_sample_weights(self, weights: np.ndarray) -> None:
+        """In-place update of the shared class_sample_weights tensor.
+
+        Must be in-place (copy_, not reassignment) so the update is visible to
+        already-forked persistent DataLoader workers, which hold a reference
+        to this same shared-memory storage.
+        """
+        self.class_sample_weights.copy_(torch.as_tensor(weights, dtype=torch.float32))
+
     def _stratified_sample_with_bg_floor(
         self,
         indices: np.ndarray,
         label_vals: np.ndarray,
         n: int,
+        inner_fn=None,
+        labels: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Stratified sample with a guaranteed minimum for background (class 0).
+        """Stratified (or weighted) sample with a guaranteed minimum for background (class 0).
 
         Reserves background_floor_frac * n_pts points for class 0, then
-        distributes the remainder equally across all other present classes.
-        Falls back to plain stratified if no background pixels are present.
+        distributes the remainder across all other present classes via inner_fn
+        (defaults to equal split, self._stratified_sample; pass self._weighted_sample
+        for difficulty-weighted sampling instead — labels is forwarded to it unchanged).
+        Falls back to inner_fn on the whole set if no background pixels are present.
         """
+        inner_fn = inner_fn or self._stratified_sample
         n_bg_floor = int(self.cfg.background_floor_frac * self.n_pts)
         bg_mask    = label_vals == 0
         bg_idx     = indices[bg_mask]
 
         if n_bg_floor == 0 or len(bg_idx) == 0:
-            return self._stratified_sample(indices, label_vals, n)
+            return inner_fn(indices, label_vals, n, labels)
 
         n_bg    = min(n_bg_floor, len(bg_idx))
         n_other = max(0, n - n_bg)
@@ -525,7 +605,7 @@ class OCTPullbackDataset(Dataset):
         other_idx  = indices[~bg_mask]
         other_vals = label_vals[~bg_mask]
         if n_other > 0 and len(other_idx) > 0:
-            other_chosen = self._stratified_sample(other_idx, other_vals, n_other)
+            other_chosen = inner_fn(other_idx, other_vals, n_other, labels)
             return np.concatenate([bg_chosen, other_chosen], axis=0)
         return bg_chosen[:n]
 
@@ -551,14 +631,20 @@ class OCTPullbackDataset(Dataset):
 
         if self.mode == "train":
             label_vals = labels[labeled_zyx[:, 0], labeled_zyx[:, 1], labeled_zyx[:, 2]]
-            if self.cfg.sampling_strategy == "stratified":
-                _sample_fn = (
-                    self._stratified_sample_with_bg_floor
-                    if self.cfg.background_floor_frac > 0
+            if self.cfg.sampling_strategy in ("stratified", "difficulty_weighted"):
+                inner_fn = (
+                    self._weighted_sample
+                    if self.cfg.sampling_strategy == "difficulty_weighted"
                     else self._stratified_sample
                 )
-                chosen = _sample_fn(labeled_zyx, label_vals,
-                                    min(n_labeled, len(labeled_zyx)))
+                if self.cfg.background_floor_frac > 0:
+                    chosen = self._stratified_sample_with_bg_floor(
+                        labeled_zyx, label_vals, min(n_labeled, len(labeled_zyx)),
+                        inner_fn=inner_fn, labels=labels,
+                    )
+                else:
+                    chosen = inner_fn(labeled_zyx, label_vals,
+                                       min(n_labeled, len(labeled_zyx)), labels)
             else:
                 chosen = labeled_zyx[
                     np.random.choice(len(labeled_zyx),

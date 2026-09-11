@@ -27,7 +27,14 @@ Usage:
         [--use_postprocessed] \
         [--output_dir /path/to/output] \
         [--env local|cluster] \
-        [--max_pullbacks 3]
+        [--max_pullbacks 3] \
+        [--eval_resolution native|encoder]
+
+--eval_resolution must match whatever Pullback_prediction.py was run with for these
+predictions: "native" (default) reads native-resolution predictions and ground truth;
+"encoder" reads predictions saved at the model's own encoder input resolution
+(cfg.resize_to) and downsamples the ground truth to match before rendering. Output
+lands in a resolution-specific folder/filename (see below) so the two never collide.
 """
 import argparse
 import colorsys
@@ -39,8 +46,25 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
+import torch
 import yaml
 import cv2
+
+# Only needed for --eval_resolution=encoder (downsampling ground truth/raw image to
+# cfg.resize_to before rendering) and to read cfg.resize_to itself -- reuses the exact
+# same resize_labels/resize_volume Pullback_prediction.py and training use, rather than
+# reimplementing a second, possibly-divergent resize here. CPU-only (no GPU needed for
+# these two functions), so this doesn't change the "no --gpus-per-task" note in
+# create_html_report.sh -- it does mean torch must be importable in whatever
+# environment runs this script (already true in the train_monai container the .sh
+# script uses).
+_CONDITIONAL_INR_REPO_LOCAL   = Path("W:/rubenvdw/Conditional_INR")
+_CONDITIONAL_INR_REPO_CLUSTER = Path("/data/diag/rubenvdw/Conditional_INR")
+for _repo_root in (_CONDITIONAL_INR_REPO_LOCAL, _CONDITIONAL_INR_REPO_CLUSTER):
+    sys.path.insert(0, str(_repo_root / "Training_model"))
+    sys.path.insert(0, str(_repo_root))
+from model import resize_labels, resize_volume                     # Training_model/model.py
+from predict_singlepullback_conditional import build_config_from_yaml
 
 # Mirrors Pullback_prediction.py's class-name convention (post label-mapping,
 # 12-class taxonomy) -- duplicated rather than imported so this script stays
@@ -391,6 +415,13 @@ def main():
     parser.add_argument("--jpeg_quality", type=int, default=90)
     parser.add_argument("--max_pullbacks", type=int, default=None, help="Only process the first N test pullbacks (debugging)")
     parser.add_argument("--pullbacks", type=str, nargs="+", default=None, help="Only process these specific pullback IDs")
+    parser.add_argument("--eval_resolution", type=str, default="native", choices=["native", "encoder"],
+                         help="Must match the --eval_resolution Pullback_prediction.py used to generate these "
+                              "predictions. 'native' (default): predictions and ground truth are both native "
+                              "resolution, unchanged behaviour. 'encoder': predictions are at the model's own "
+                              "encoder input resolution (cfg.resize_to) -- ground truth (and the raw OCT image) "
+                              "are downsampled to match (nearest-neighbour for labels, bilinear for the image, "
+                              "same functions training/Pullback_prediction.py use) before rendering.")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -401,15 +432,30 @@ def main():
         yml = yaml.safe_load(f)
     if args.env:
         yml["env"] = args.env
+    cfg = build_config_from_yaml(yml)
 
-    pred_dir = Path(args.pred_dir) if args.pred_dir else model_dir / "test_metrics" / "predictions"
-    output_dir = Path(args.output_dir) if args.output_dir else model_dir / "test_metrics" / "html_report"
+    # Mirrors Pullback_prediction.py's own output-folder naming exactly (overlap suffix,
+    # plus "_encoderres" for --eval_resolution=encoder) so this script's default pred_dir
+    # actually finds what that script wrote, and so the two eval_resolution modes' outputs
+    # (predictions AND this report) never land in, or overwrite, the same folder.
+    overlap_suffix   = str(args.overlap).replace(".", "")
+    eval_dir_suffix  = "_encoderres" if args.eval_resolution == "encoder" else ""
+    test_metrics_dir = model_dir / f"test_metrics_{overlap_suffix}{eval_dir_suffix}"
+
+    pred_dir   = Path(args.pred_dir) if args.pred_dir else test_metrics_dir / "predictions"
+    output_dir = Path(args.output_dir) if args.output_dir else test_metrics_dir / "html_report"
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    # Distinct filename too (not just a distinct folder) -- belt-and-suspenders so an
+    # explicit --output_dir pointed at the same place for both modes still can't clobber
+    # the other mode's report.
+    report_name = "report.html" if args.eval_resolution == "native" else f"report_{args.eval_resolution}res.html"
+
     if not pred_dir.exists():
         raise FileNotFoundError(
-            f"{pred_dir} does not exist -- run Pullback_prediction.py first to generate predictions "
+            f"{pred_dir} does not exist -- run Pullback_prediction.py first with the same "
+            f"--eval_resolution {args.eval_resolution} to generate predictions "
             f"(or pass --pred_dir to point at an existing folder of *_pred_overlap*.nii.gz files)"
         )
 
@@ -457,7 +503,23 @@ def main():
         if label_mapping:
             seg = remap_labels(seg, label_mapping)
 
+        # Same eval_resolution="encoder" ground-truth downsampling as Pullback_prediction.py:
+        # nearest-neighbour for labels (crisp boundaries, no invented intermediate classes),
+        # bilinear for the raw image (rendering only). No-op for "native" or when
+        # cfg.resize_to == 0 (e.g. the native704 model has nothing to downsample to).
+        if args.eval_resolution == "encoder" and cfg.resize_to:
+            seg_eval    = resize_labels(torch.from_numpy(seg), cfg.resize_to).numpy()
+            volume_eval = resize_volume(torch.from_numpy(volume), cfg.resize_to).numpy()
+        else:
+            seg_eval    = seg
+            volume_eval = volume
+
         pred = sitk.GetArrayFromImage(sitk.ReadImage(str(pred_path)))  # [D,H,W]
+        assert pred.shape[1:] == seg_eval.shape[1:], (
+            f"{pid}: pred grid {pred.shape[1:]} != ground-truth grid {seg_eval.shape[1:]} "
+            f"(eval_resolution={args.eval_resolution}, cfg.resize_to={cfg.resize_to}) -- "
+            f"was {pred_path.name} generated with --eval_resolution {args.eval_resolution}?"
+        )
 
         D = volume.shape[0]
         valid_frames = sorted(z for z in set(ann_frames) if 0 <= z < D)
@@ -472,10 +534,10 @@ def main():
         pid_img_dir.mkdir(parents=True, exist_ok=True)
 
         for z in valid_frames:
-            gt_frame = seg[z]
+            gt_frame = seg_eval[z]
             pred_frame = pred[z]
 
-            raw_rgb = np.stack([to_uint8_display(volume[z])] * 3, axis=-1)
+            raw_rgb = np.stack([to_uint8_display(volume_eval[z])] * 3, axis=-1)
             colored_gt = colorize(gt_frame, class_colors)
             colored_pred = colorize(pred_frame, class_colors)
             overlay_gt = blend_overlay(raw_rgb, colored_gt, gt_frame > 0, args.alpha)
@@ -507,7 +569,7 @@ def main():
         print("[ERROR] No frames were rendered -- nothing to write.")
         return
 
-    report_path = output_dir / "report.html"
+    report_path = output_dir / report_name
     build_html(manifest, class_names, class_colors, report_path)
     print(f"\n[INFO] Wrote {report_path} ({len(manifest)} frames across {n_done} pullbacks)")
     print(f"[INFO] Open it directly in a browser (file://{report_path.resolve()})")

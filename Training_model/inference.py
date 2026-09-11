@@ -59,6 +59,11 @@ def predict_pullback(
     device:       torch.device,
     chunk_size:   int   = 16384,     # voxels processed per INR forward pass (tune for VRAM)
     overlap_frac: float = 0.0,       # fraction of patch_z that overlaps between patches
+    query_hw:     "int | None" = None,   # if set, query the INR on a (query_hw, query_hw) coordinate
+                                          # grid instead of the encoder input's own (H, W) — lets the
+                                          # encoder see a downsampled volume while predictions come out
+                                          # at a finer resolution (e.g. encoder fed 256, queried at
+                                          # native 704). None (default) = old behaviour, grid == (H, W).
     use_amp:      bool  = False,     # autocast (bfloat16) forward passes — inference only, no
                                       # backward pass, so the SIREN-gradient-overflow risk that
                                       # rules out AMP for training doesn't apply. bfloat16 (not
@@ -88,14 +93,18 @@ def predict_pullback(
     D, H, W = volume.shape
     pz       = cfg.patch_z
     C        = cfg.num_classes
+    qH, qW   = (query_hw, query_hw) if query_hw else (H, W)
 
     stride = max(1, round(pz * (1.0 - overlap_frac)))
 
     # Accumulate logit sums; argmax of sum == argmax of average
-    logit_sum = np.zeros((D, H, W, C), dtype=np.float32)
+    logit_sum = np.zeros((D, qH, qW, C), dtype=np.float32)
 
-    # Pre-build local (x, y, z_local) coordinate grid once — same for every patch
-    zz, yy, xx = np.meshgrid(np.arange(pz), np.arange(H), np.arange(W), indexing="ij")
+    # Pre-build local (x, y, z_local) coordinate grid once — same for every patch.
+    # Indexed on (qH, qW): the query grid, which may be finer than the encoder
+    # input's own (H, W) — decode_3d's grid_sample handles that resolution
+    # mismatch transparently (see model.py normalize_coords_for_grid_sample).
+    zz, yy, xx = np.meshgrid(np.arange(pz), np.arange(qH), np.arange(qW), indexing="ij")
     patch_coords = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3).astype(np.float32)
 
     z_start = 0
@@ -141,16 +150,16 @@ def predict_pullback(
         # call forces a device sync, so doing it inside this loop (chunk_size default
         # 16384 → ~256 chunks per patch) serializes GPU work behind ~256 stalls per
         # patch instead of letting the chunk loop's kernels queue back-to-back.
-        patch_logits_gpu = torch.empty((pz * H * W, C), dtype=torch.float32, device=device)
+        patch_logits_gpu = torch.empty((pz * qH * qW, C), dtype=torch.float32, device=device)
         for s in range(0, len(patch_coords), chunk_size):
             e      = min(s + chunk_size, len(patch_coords))
             coords = torch.from_numpy(patch_coords[s:e]).unsqueeze(0).to(device)
-            logits = model.decode_3d(feat_vol, g_feat, coords, (pz, H, W),
+            logits = model.decode_3d(feat_vol, g_feat, coords, (pz, qH, qW),
                                       layer1=l1, layer2=l2, layer3=l3, layer4=l4)
             patch_logits_gpu[s:e] = logits.squeeze(0).float()
         patch_logits = patch_logits_gpu.cpu().numpy()   # single sync point per patch
 
-        logit_sum[z_start:z_end] += patch_logits.reshape(pz, H, W, C)[:actual_len]
+        logit_sum[z_start:z_end] += patch_logits.reshape(pz, qH, qW, C)[:actual_len]
         z_start += stride
 
     return logit_sum.argmax(axis=-1).astype(np.int64)
