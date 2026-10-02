@@ -8,7 +8,7 @@
 #SBATCH --container-image="dockerdex.umcn.nl:5005#rubenvdwaerden1997/train_monai:v1.4"
 #SBATCH -o ./SLURM/Slurm_output_3D/_slurm_output_conditional_inr_%j.txt
 #SBATCH -e ./SLURM/Slurm_output_3D/_slurm_error_conditional_inr_%j.txt
-#SBATCH --qos=high
+#SBATCH --qos=vram
 #SBATCH --exclude=dlc-mewtwo,dlc-nidoking,dlc-scyther,dlc-zapdos,dlc-articuno,dlc-lugia,dlc-moltres,dlc-tornadus,dlc-slowpoke
 
 echo "Running on node:" $(hostname)

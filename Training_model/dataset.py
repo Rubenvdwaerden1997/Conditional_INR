@@ -256,6 +256,62 @@ class OCTPullbackDataset(Dataset):
         ds._unc_volume_shape = (D, H, W)
         return ds
 
+    @classmethod
+    def from_zarr(
+        cls,
+        store_path: str,
+        cfg: Config,
+        set_excel: str = "training",
+        **kwargs,
+    ) -> "OCTPullbackDataset":
+        """Build dataset from a zarr frame store built by Preprocess_codes_Simone/run_build_store.py.
+
+        Only 3D mode is supported. One entry per (pullback, annotated frame) pair -- matches the
+        .npz pipeline's prebuilt_3d entry structure exactly (dataset.py:181-187's "one entry per
+        annotated frame" comment), not one entry per pullback. This matters beyond just entry
+        count: len(train_ds) drives max_batches_frac's "epoch" size, so one-entry-per-pullback
+        made a zarr "epoch" ~15x smaller than the equivalent .npz run (240 pullbacks vs 3704
+        frames, confirmed by comparing actual training logs) -- not merely fewer samples, but a
+        completely different effective training volume at the same epoch number, and a different
+        per-pullback sampling weight (every pullback got equal draw probability regardless of its
+        real annotated-frame count, instead of naturally more-annotated pullbacks getting
+        proportionally more exposure). Each entry still carries the pullback's full
+        `annotated_frames` list too (not just its own target frame), since more than one
+        annotated frame can land inside one sampled window and all of them should contribute
+        real label supervision there, same as the on-the-fly/prebuilt_3d branches already do.
+
+        Only its manually-annotated frames (the store's own `manual_frames`) ever contribute
+        real label supervision — every other frame in a sampled window is ignore_index,
+        regardless of what the store's dense `label` array happens to contain there (some
+        pullbacks are only sparsely labelled).
+        """
+        import zarr_store_reader   # lazy: only datasets actually using a zarr store need the package
+        assert cfg.training_mode == "3D", "from_zarr only supports training_mode == '3D'"
+        split_map = {"training": "train", "validation": "val", "testing": "test"}
+        split = split_map[set_excel.lower()]
+
+        pullbacks = zarr_store_reader.load_pullbacks_table(store_path)
+        pullbacks = pullbacks[(pullbacks["split"] == split) & (pullbacks["has_label"])]
+
+        entries = [
+            {"zarr": True, "pullback": str(row.pullback_id), "z_ann": int(z),
+             "annotated_frames": [int(zz) for zz in row.manual_frames]}
+            for row in pullbacks.itertuples()
+            for z in row.manual_frames
+        ]
+        print(f"[{set_excel}] {len(entries)} frames found (zarr store: {store_path}).")
+
+        ds = cls(entries, cfg, **kwargs)
+        ds.zarr_root = zarr_store_reader.open_store(store_path)
+        # Per-pullback foreground mean/std (matches the .npz pipeline's per-pullback
+        # normalisation exactly — see zarr_store_reader.load_pullback_norm_stats docstring).
+        # Global corpus-wide stats kept only as a fallback for a pullback somehow missing from
+        # the per-pullback dict (shouldn't happen for an "ok" + has_label pullback, but cheap
+        # to guard against rather than crash on a lookup miss).
+        ds.pullback_norm_stats = zarr_store_reader.load_pullback_norm_stats(store_path)
+        ds.zarr_mean, ds.zarr_std = zarr_store_reader.load_norm_stats(store_path)
+        return ds
+
     # ------------------------------------------------------------------
 
     def __len__(self):
@@ -373,6 +429,58 @@ class OCTPullbackDataset(Dataset):
             Training: annotated frame chosen randomly each call.
             Validation: middle annotated frame (deterministic).
         """
+        if entry.get("zarr"):
+            import zarr_store_reader   # lazy: only entries from from_zarr() need the package
+            pid = entry["pullback"]
+            n_frames = self.zarr_root[pid]["image"].shape[0]
+            ann = [z for z in entry["annotated_frames"] if 0 <= z < n_frames] or [n_frames // 2]
+            # This entry's own target frame (one entry per annotated frame now, see from_zarr) --
+            # not a random/middle choice across the pullback's other frames; `ann` is still kept
+            # (the pullback's full annotated_frames list) only to fill labels for any other
+            # annotated frame that happens to land inside the sampled window too, below.
+            z_ann    = entry["z_ann"]
+            z_center = z_ann if 0 <= z_ann < n_frames else ann[len(ann) // 2]
+            pz       = self.cfg.patch_z
+            if self.mode == "train":
+                # Random sub-window placement: the annotated frame lands anywhere in
+                # [0, pz-1] within the sampled window -- matches the .npz pipeline's
+                # prebuilt_3d branch above exactly (dataset.py:389-393), just applied to the
+                # full native pullback directly instead of a pre-extracted 2*patch_z buffer
+                # (zarr gives direct random access to the whole volume, no need for that
+                # buffer workaround). Previously this branch always centered the window
+                # deterministically even during training, missing this z-augmentation
+                # entirely -- a real, confirmed cause of a persistent Dice gap vs the .npz
+                # baseline (see session notes: every other difference was checked and ruled
+                # out byte-for-byte: LUT, raw DICOM pixels, label voxels, mask order).
+                s_min = max(0, z_center - (pz - 1))
+                s_max = min(max(0, n_frames - pz), z_center)
+                z_start = int(np.random.randint(s_min, s_max + 1)) if s_max >= s_min else 0
+            else:
+                # Validation: fixed sub-window centred on the annotated frame (deterministic) --
+                # matches the .npz pipeline's prebuilt_3d validation behaviour exactly, which
+                # was already correct here even before this fix.
+                z_start = int(np.clip(z_center - pz // 2, 0, max(0, n_frames - pz)))
+            z_end = z_start + pz
+
+            image_window = zarr_store_reader.read_image_window(self.zarr_root, pid, z_start, z_end)
+            mean, std = self.pullback_norm_stats.get(pid, (self.zarr_mean, self.zarr_std))
+            patch_vol = (image_window.astype(np.float32) - mean) / (std + 1e-5)
+            if patch_vol.shape[0] < pz:
+                pad       = pz - patch_vol.shape[0]
+                patch_vol = np.pad(patch_vol, ((0, pad), (0, 0), (0, 0)), mode="edge")
+
+            _, H, W      = patch_vol.shape
+            patch_labels = np.full((pz, H, W), self.cfg.ignore_index, dtype=np.int64)
+            for z_ann in ann:
+                if z_start <= z_ann < z_end:
+                    raw_label = zarr_store_reader.read_label_frame(self.zarr_root, pid, z_ann)
+                    raw_label = raw_label.astype(np.int64)
+                    if self.mapping_activated and self.label_mapping:
+                        raw_label = self._remap(raw_label, self.label_mapping)
+                    patch_labels[z_ann - z_start] = raw_label
+            patch_vol, patch_labels = self._resize_xy_labels(patch_vol, patch_labels)
+            return patch_vol, patch_labels
+
         if entry.get("prebuilt_3d"):
             data = self._file_cache.get(entry["file"]) or dict(np.load(entry["file"], allow_pickle=False))
             buffer         = data["patch"].astype(np.float32)    # [2*patch_z, H, W]

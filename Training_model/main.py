@@ -49,6 +49,8 @@ def build_config(yml: dict) -> Config:
         context_frames       = yml.get("context_frames", 0),
         frames_folder         = yml["paths"][yml["env"]].get("frames_folder", ""),
         patches_folder_3d     = yml["paths"][yml["env"]].get("patches_folder_3d", ""),
+        zarr_store            = yml["paths"][yml["env"]].get("zarr_store", ""),
+        zarr_local_cache      = yml["paths"][yml["env"]].get("zarr_local_cache", ""),
         ignore_index                = tr.get("ignore_index", 255),
         ignore_background           = tr.get("ignore_background", False),
         feature_supervision         = tr.get("feature_supervision", False),
@@ -93,8 +95,12 @@ def build_config(yml: dict) -> Config:
         tversky_class_beta          = tr.get("tversky_class_beta", {}),
         encoder_z_strides           = seg.get("encoder_z_strides", [1, 1, 1]),
         feature_sampling            = seg.get("feature_sampling", "trilinear"),
+        encoder_type                = seg.get("encoder_type", "3d"),
         max_batches_frac            = tr.get("max_batches_frac", 0.0),
         val_interval_pct            = tr.get("val_interval_pct", 0.0),
+        num_workers                 = tr.get("num_workers", 8),
+        val_num_workers              = tr.get("val_num_workers", 4),
+        prefetch_factor              = tr.get("prefetch_factor", 2),
     )
 
 
@@ -119,7 +125,9 @@ def sanity_check(cfg: Config) -> None:
         coords = torch.rand(B, N, 2) * torch.tensor([W, H], dtype=torch.float32)
         logits = model(volume, coords)
     else:
-        D      = 32
+        D      = cfg.patch_z   # real patch depth, not an arbitrary constant: ResNetEncoder2p5D's
+                                # stem is built for exactly cfg.patch_z input channels (it treats
+                                # the depth axis as channels), so a mismatched D would break it.
         model  = ConditionalINR(cfg)
         volume = torch.randn(B, 1, D, H, W)
         coords = torch.rand(B, N, 3) * torch.tensor([W, H, D], dtype=torch.float32)
@@ -330,6 +338,19 @@ def main():
         )
         val_ds = OCTPullbackDataset.from_single_volume(
             npz_path, ann_frames, cfg, mode="val", **dataset_kwargs,
+        )
+    elif cfg.zarr_store:
+        import zarr_store_reader   # lazy: only configs that actually use zarr_store need the package
+        store_path = cfg.zarr_store
+        if cfg.zarr_local_cache:
+            store_path = zarr_store_reader.ensure_local_copy(cfg.zarr_store, cfg.zarr_local_cache)
+        train_ds = OCTPullbackDataset.from_zarr(
+            store_path, cfg, set_excel="training",
+            mode="train", augment=True, **dataset_kwargs,
+        )
+        val_ds = OCTPullbackDataset.from_zarr(
+            store_path, cfg, set_excel="validation",
+            mode="val", augment=False, **dataset_kwargs,
         )
     else:
         train_ds = OCTPullbackDataset.from_excel(

@@ -1,0 +1,115 @@
+# ============================
+# General Settings
+# ============================
+env: "cluster"   #"local" or "cluster"
+training_mode: "3D"   # "2D" trains on annotated frames only; "3D" trains on full volumes
+save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_2p5D_conditional"
+experiment_name: "conditional_3D_relu_cedice_trilinear_encoder64_depth5_nodense_2p5d_foregroundnorm_perpullbacknorm_zjitter_perframe"
+
+seed: 42
+device: "cuda"   # or "cpu"
+
+# ============================
+# Data Settings
+# ============================
+# Same model/training settings as config_..._foregroundnorm.yaml (the current best, Val Dice
+# 0.6525) -- two differences: encoder_type: "2.5d" below (model_seg_decoder), and the data
+# backend is the zarr frame store (zarr_store) instead of the old .npz data_root/patches_folder_3d
+# pipeline, for speed (see main.py: cfg.zarr_store takes priority over data_root/patches_folder_3d
+# when set; zarr_local_cache additionally rsyncs the store to node-local scratch once per cluster
+# job before training, mirroring oct-fm's train_seg.sbatch). data_root/patches_folder_3d are kept
+# here only as unused fallback reference, not read while zarr_store is set.
+paths:
+  local:
+    data_root: ["W:/rubenvdw/Dataset/3D_Grayscale_Circmask_ForegroundZNorm_Dicoms_Segmentations_12classes_31072026"]
+    split_excel: "W:/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "W:/rubenvdw/Conditional_INR/Patches_preprocessed_3D_foregroundnorm"
+    zarr_store: "W:/rubenvdw/Dataset/Grayscale_Circmask_Unnormalized_OctFmZarrStore_17classes_30092026"
+    zarr_local_cache: ""
+  cluster:
+    data_root: ["/data/diag/rubenvdw/Dataset/3D_Grayscale_Circmask_ForegroundZNorm_Dicoms_Segmentations_12classes_31072026"]
+    split_excel: "/data/diag/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "/data/diag/rubenvdw/Conditional_INR/Patches_preprocessed_3D_foregroundnorm"
+    zarr_store: "/data/diag/rubenvdw/Dataset/Grayscale_Circmask_Unnormalized_OctFmZarrStore_17classes_30092026"
+    zarr_local_cache: "/mnt/jobcache/oct_fm_store"
+train_batch_size: 2
+
+# ============================
+# Model Settings
+# ============================
+model_seg_decoder:
+  out_channels: 12
+  feature_size: 64          # bigger encoder: 64 channels instead of 16 (~150k encoder params vs 11k)
+  use_local_features: True
+  use_dense_decoder: False  # 2.5d encoder doesn't support this yet (see config.py __post_init__ assert)
+  dense_decoder_skip_connections: False   # irrelevant when use_dense_decoder is False
+  encoder_depth: 5          # matches depth5_nodense_relu (current best) -- only change vs it is the encoder type
+  use_intermediate_features: False   # 2.5d encoder doesn't support this yet (see config.py __post_init__ assert)
+  global_feat_ch: 64
+  dilation_xy: 1
+  encoder_type: "2.5d"      # patch_z frames stacked as input channels to a 2D encoder, instead of true 3D convs
+  feature_sampling: "trilinear"
+  inr_hidden: 128
+  inr_depth: 4
+  inr_activation: "relu"   # Fourier PE + concatenated features -> ReLU MLP, no periodic SIREN/FiLM
+  siren_omega_0: 30.0      # unused when inr_activation="relu"
+  num_freqs_xy: 4
+  num_freqs_z: 4           # the 2.5d encoder has no z-local features -- this PE is the model's only z-awareness
+  mapping_activated: True
+  mapping:
+    0: 0 # Background
+    1: 1 # Lumen
+    2: 2 # Guidewire
+    3: 3 # Intima
+    4: 4 # Lipid
+    5: 5 # Calcium
+    6: 6 # Media
+    7: 1 # Catheter
+    8: 7 # Sidebranch
+    9: 8 # Red thrombus
+    10: 8 # White thrombus
+    11: 3 # Dissection
+    12: 9 # Plaque rupture
+    13: 10 # Layered plaque
+    14: 11 # Neovascularization
+    15: 3 # Intraplaque hemorrhage
+    16: 3 # Intramural hematoma
+
+# ============================
+# Training Settings
+# ============================
+training_segmentation:
+  epochs: 300
+  warmup_epochs: 5
+  lr_settings:
+    initial_lr: 0.0003
+    weight_decay: 0.0001
+  val_interval: 5
+  ignore_index: 255
+  ignore_background: True
+  feature_supervision: False
+  tv_loss_weight: 0.0
+  smoothness_3d_weight: 0.0
+  smoothness_2d_weight: 0.0
+  smoothness_2d_n_pairs: 1024
+  smoothness_class_indices: [0,1,3,4,5,6,7,10]
+  patch_z: 16
+  resize_to: 512
+  sampling_strategy: "random"
+  background_floor_frac: 0.0
+  n_points: 524288
+  preload_data: False
+  preload_frac: 0.3
+  use_amp: False
+  grad_clip_norm: 0.0
+  loss_type: "ce_dice"
+  dense_decoder_weight: 1.0   # unused when use_dense_decoder is False
+  max_batches_frac: 0.25
+  val_interval_pct: 0.05
+  # Raised from the defaults (8/4/2) per supervisor's advice after seeing DataWait% in the
+  # training log -- more parallel DataLoader workers and a deeper per-worker prefetch queue
+  # reduce GPU idle time if the zarr read + per-pullback-norm + z-jitter pipeline can't keep
+  # up. Matching --cpus-per-task=13 in the .sh (12 workers + 1 main process) is required.
+  num_workers: 12
+  val_num_workers: 6
+  prefetch_factor: 4

@@ -150,6 +150,18 @@ def _save_vis_predictions(
             plt.close(fig)
         return
 
+    # Open the zarr store once (metadata only, cheap) rather than per-entry inside the loop
+    # below — all vis_entries come from the same dataset, so they're uniformly zarr or not.
+    zarr_root = pullback_norm_stats = zarr_mean = zarr_std = None
+    if vis_entries and vis_entries[0].get("zarr"):
+        import zarr_store_reader
+        zarr_root = zarr_store_reader.open_store(cfg.zarr_store)
+        # Per-pullback stats (matches dataset.py's from_zarr/_load_3d_patch exactly — see
+        # zarr_store_reader.load_pullback_norm_stats docstring); global kept only as a
+        # per-pullback-lookup-miss fallback.
+        pullback_norm_stats = zarr_store_reader.load_pullback_norm_stats(cfg.zarr_store)
+        zarr_mean, zarr_std = zarr_store_reader.load_norm_stats(cfg.zarr_store)
+
     for entry in vis_entries:
         pred_dense = None
         if entry.get("prebuilt_3d"):
@@ -188,6 +200,32 @@ def _save_vis_predictions(
                             d_logits, size=patch.shape, mode="trilinear", align_corners=False,
                         )
                 pred_dense = d_logits.argmax(dim=1).squeeze(0).cpu().numpy()[z_local]
+        elif entry.get("zarr"):
+            # Mirrors the on-the-fly branch below exactly, reading from the zarr store instead
+            # of an .npz (from_zarr()'s entries have no "file" key at all — {"zarr": True,
+            # "pullback": pid, "annotated_frames": [...]} — hence the KeyError this branch fixes).
+            # zarr_root/zarr_mean/zarr_std are opened once above, outside this loop. Always reads
+            # from cfg.zarr_store (the original /data/diag path), not any zarr_local_cache copy --
+            # that copy lives on one specific node and isn't guaranteed to still be the node this
+            # job is running on.
+            pid = entry["pullback"]
+            n_frames   = zarr_root[pid]["image"].shape[0]
+            image_full = zarr_store_reader.read_image_window(zarr_root, pid, 0, n_frames)
+            mean, std  = pullback_norm_stats.get(pid, (zarr_mean, zarr_std))
+            vol        = (image_full.astype(np.float32) - mean) / (std + 1e-5)   # [D, H, W] native res
+
+            native_hw     = vol.shape[-1]
+            encoder_input = resize_volume(torch.from_numpy(vol), cfg.resize_to).numpy() if cfg.resize_to else vol
+            pred_vol      = predict_pullback(model, encoder_input, cfg, device,
+                                              query_hw=native_hw if cfg.resize_to else None)
+            ann      = entry["annotated_frames"]
+            z        = ann[len(ann) // 2]       # middle annotated frame
+            img      = vol[z]
+            gt_label = zarr_store_reader.read_label_frame(zarr_root, pid, z).astype(np.int64)   # raw17
+            if label_mapping:
+                gt_label = _remap_labels(gt_label, label_mapping)
+            pred = pred_vol[z]
+            tag  = f"{entry['pullback']}_frame{z:04d}"
         else:
             data = np.load(entry["file"], allow_pickle=False)
             vol  = data["Volume_input_image"]
@@ -487,10 +525,20 @@ def train_one_epoch(
     import time
     model.train()
     total_loss = 0.0
-    log_accum  = {"ce": 0.0, "dice": 0.0, "mse_onehot": 0.0, "smooth_3d": 0.0, "smooth_2d": 0.0, "feat_sup": 0.0, "tv": 0.0, "dense_dec": 0.0, "radial_media_boundary": 0.0, "radial_guidewire_truncation": 0.0}
+    log_accum  = {"ce": 0.0, "dice": 0.0, "mse_onehot": 0.0, "smooth_3d": 0.0, "smooth_2d": 0.0, "feat_sup": 0.0, "tv": 0.0, "dense_dec": 0.0, "radial_media_boundary": 0.0, "radial_guidewire_truncation": 0.0, "wait_pct": 0.0}
     n_batches  = 0
-
-    for volume_or_shape, coords, labels, full_label in loader:
+    # Dataloader-wait instrumentation: times next(it) explicitly, same methodology as
+    # oct-fm's SegTrainer.fit() (seg_loop.py) -- "t0 = time.time(); batch = next(it);
+    # data_wait += time.time() - t0" -- so DataWait% is directly comparable between the
+    # two codebases, not just conceptually similar.
+    it = iter(loader)
+    while True:
+        t_fetch   = time.time()
+        batch     = next(it, None)
+        wait_time = time.time() - t_fetch
+        if batch is None:
+            break
+        volume_or_shape, coords, labels, full_label = batch
         t0         = time.time()
         coords     = coords.to(device)
         labels     = labels.to(device)
@@ -627,12 +675,16 @@ def train_one_epoch(
             log_accum[k] = log_accum.get(k, 0.0) + v
         n_batches += 1
 
+        compute_time  = time.time() - t0
+        wait_pct      = 100.0 * wait_time / max(wait_time + compute_time, 1e-9)
+        log_accum["wait_pct"] += wait_pct
+
         if n_batches == 1 and logger is not None:
-            batch_time  = time.time() - t0
+            batch_time  = compute_time
             n_effective = max_batches if max_batches > 0 else len(loader)
             est_epoch   = batch_time * n_effective
             logger.info(
-                f"First batch done in {batch_time:.1f}s — "
+                f"First batch done in {batch_time:.1f}s (DataWait={wait_pct:.1f}%) — "
                 f"est. {est_epoch / 60:.1f} min/epoch "
                 f"({n_effective} batches)"
             )
@@ -754,18 +806,23 @@ def train(
     logger.info(f"Train samples: {len(train_ds)}   Val samples: {len(val_ds)}")
 
     # Unconditional: everything is in RAM — workers only add IPC overhead
-    train_workers = 0 if cfg.unconditional else 8
-    val_workers   = 0 if cfg.unconditional else 4
+    train_workers = 0 if cfg.unconditional else cfg.num_workers
+    val_workers   = 0 if cfg.unconditional else cfg.val_num_workers
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
         num_workers=train_workers, pin_memory=(not cfg.unconditional),
         persistent_workers=(train_workers > 0),
+        **({"prefetch_factor": cfg.prefetch_factor} if train_workers > 0 else {}),
     )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
         num_workers=val_workers, pin_memory=(not cfg.unconditional),
         persistent_workers=(val_workers > 0),
+        **({"prefetch_factor": cfg.prefetch_factor} if val_workers > 0 else {}),
     )
+    if logger is not None:
+        logger.info(f"DataLoader: num_workers={train_workers} (val={val_workers}), "
+                    f"prefetch_factor={cfg.prefetch_factor}")
 
     model  = (UnconditionalINR(cfg) if cfg.unconditional else ConditionalINR(cfg)).to(device)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.use_amp)
@@ -913,6 +970,7 @@ def train(
                 f"(×{cfg.radial_guidewire_prior_weight})"
             )
         log_str += ")"
+        log_str += f" | DataWait={train_log.get('wait_pct', 0):.1f}%"
 
         if epoch % eff_val_interval == 0 or epoch == cfg.num_epochs or epoch == 1:
             val_loss, val_dice, val_dice_per_class = validate(model, val_loader, cfg, device)

@@ -30,7 +30,9 @@ class Config:
     use_dense_decoder:    bool  = False  # add symmetric upsampling decoder as diagnostic head alongside the INR
     dense_decoder_weight: float = 1.0   # CE loss weight for the dense decoder
     # Give the dense decoder real UNet-style skip connections from encoder layer1(H/2)/layer2(H/4)
-    # instead of no-skip upsampling. Only used when use_dense_decoder=True.
+    # instead of no-skip upsampling. Used when use_dense_decoder=True (ConditionalINR's 3D
+    # diagnostic head) and also by the standalone ResidualUNet2p5D (train_unet.py) — same flag,
+    # same meaning, for either model.
     dense_decoder_skip_connections: bool = False
     num_freqs_xy: int   = 6       # Fourier frequencies for x, y (fine in-plane detail)
     num_freqs_z:  int   = 4       # fewer frequencies for coarser z axis
@@ -43,6 +45,17 @@ class Config:
     lr:           float = 1e-4
     weight_decay: float = 1e-5
     n_points:     int   = 8192    # query coordinates sampled per volume per step
+
+    # DataLoader — defaults match what was previously hardcoded in trainer.py/train_unet.py
+    # (train_workers=8, val_workers=4, PyTorch's own prefetch_factor default of 2), so an
+    # existing config that doesn't set these keeps identical behavior. Raise num_workers
+    # and/or prefetch_factor when DataWait% (trainer.py's train_one_epoch /
+    # train_unet.py's train_one_epoch_unet) shows the GPU is idle waiting on the loader —
+    # more workers means more parallel batch-prep processes, more prefetch_factor means
+    # each worker queues further ahead, both trading CPU/RAM for less GPU idle time.
+    num_workers:      int = 8
+    val_num_workers:  int = 4
+    prefetch_factor:  int = 2
 
     # Loss weights
     dice_weight:          float = 1.0
@@ -112,6 +125,14 @@ class Config:
     # Pre-split 3D patch .npz folder produced by preprocess_frames.py --mode 3d.
     # Leave empty to fall back to on-the-fly patch extraction from full volumes.
     patches_folder_3d: str = ""
+
+    # Zarr frame store built by Preprocess_codes_Simone/run_build_store.py. Leave empty to use
+    # the existing .npz-based data_root/patches_folder_3d pipeline unchanged.
+    zarr_store: str = ""
+
+    # Node-local scratch dir to rsync zarr_store into once per job before training (e.g.
+    # /mnt/jobcache/...). Leave empty to read zarr_store directly (e.g. no such mount locally).
+    zarr_local_cache: str = ""
 
     # Output
     checkpoint_dir: str = "checkpoints"
@@ -275,6 +296,12 @@ class Config:
     #               FiLM specificity → smoother grouped predictions.
     feature_sampling: str = "trilinear"
 
+    # "3d": true 3D-convolutional encoder (ResNetEncoder3D), z resolution preserved.
+    # "2.5d": patch_z frames stacked as input channels to a 2D encoder (ResNetEncoder2p5D) —
+    #         classic 2.5D/pseudo-3D segmentation; feature volume has no z resolution (D'=1),
+    #         z-awareness comes only from the z positional encoding + global feature.
+    encoder_type: str = "3d"
+
     # Unconditional INR: overfit a single MLP on one 3D volume (no encoder).
     # Maps AnisotropicPE(x, y, z) → class logits directly.
     # Use to study INR representational capacity and smoothness before adding conditioning.
@@ -287,10 +314,17 @@ class Config:
             self.xy_spacing *= self.native_xy_size / self.resize_to
         assert self.encoder_depth in (3, 5, 7), \
             f"encoder_depth must be 3, 5, or 7, got {self.encoder_depth}"
-        assert len(self.encoder_z_strides) == self.encoder_depth, \
+        assert self.encoder_type != "3d" or len(self.encoder_z_strides) == self.encoder_depth, \
             f"encoder_z_strides must have exactly {self.encoder_depth} values, got {self.encoder_z_strides}"
         assert self.feature_sampling in ("trilinear", "liif"), \
             f"feature_sampling must be 'trilinear' or 'liif', got '{self.feature_sampling}'"
         assert not (self.use_intermediate_features and self.encoder_depth not in (3, 5)), \
             "use_intermediate_features (INR multiscale conditioning) is only implemented for " \
             "encoder_depth=3 or 5 so far (no forward_deep_multiscale equivalent for depth=7)."
+        assert self.encoder_type in ("3d", "2.5d"), \
+            f"encoder_type must be '3d' or '2.5d', got '{self.encoder_type}'"
+        assert not (self.encoder_type == "2.5d" and (self.use_dense_decoder or self.use_intermediate_features)), \
+            "encoder_type='2.5d' (ResNetEncoder2p5D) does not yet support ConditionalINR's " \
+            "use_dense_decoder/use_intermediate_features — forward_deep_multiscale exists on the " \
+            "encoder (used by the standalone ResidualUNet2p5D / dense_decoder_skip_connections), " \
+            "just not wired into ConditionalINR's own dense-decoder path."

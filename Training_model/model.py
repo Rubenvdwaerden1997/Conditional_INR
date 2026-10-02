@@ -412,6 +412,156 @@ class ResNetEncoder3D(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# 2.5D ("pseudo-3D") ResNet encoder — context frames as input channels
+# ---------------------------------------------------------------------------
+
+class ResBlock2D(nn.Module):
+    """Standard 2D residual block — ResBlock3D (above) with the Z axis removed entirely."""
+
+    def __init__(self, in_ch: int, out_ch: int, stride_xy: int = 1, dilation_xy: int = 1):
+        super().__init__()
+        pad = dilation_xy
+
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride_xy,
+                               padding=pad, dilation=dilation_xy, bias=False)
+        self.norm1 = nn.GroupNorm(min(8, out_ch), out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3,
+                               padding=pad, dilation=dilation_xy, bias=False)
+        self.norm2 = nn.GroupNorm(min(8, out_ch), out_ch)
+        self.act   = nn.ReLU(inplace=True)
+
+        if stride_xy != 1 or in_ch != out_ch:
+            self.shortcut: nn.Module = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride_xy, bias=False),
+                nn.GroupNorm(min(8, out_ch), out_ch),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.shortcut(x)
+        out      = self.act(self.norm1(self.conv1(x)))
+        out      = self.norm2(self.conv2(out))
+        return self.act(out + identity)
+
+
+class ResNetEncoder2p5D(nn.Module):
+    """2.5D ("pseudo-3D") encoder: the whole patch_z window is stacked as input
+    channels to a 2D ResNet, instead of running true 3D convolutions over it
+    (ResNetEncoder3D, above). Classic 2.5D segmentation — context frames feed
+    the central/annotated frame's prediction as extra channels, not as a
+    separate spatial axis.
+
+    Because the Z axis is collapsed into channels before any convolution runs,
+    the returned feature volume has no z resolution (D'=1): every z-coordinate
+    queried downstream (decode_3d's grid_sample) samples the same single
+    feature plane. Z-awareness for the INR then comes entirely from the
+    existing z positional encoding (num_freqs_z) and the pooled global
+    feature, not from a per-z-slice local feature — a deliberate design choice
+    (confirmed with the user), not an oversight.
+
+    Returns:
+        feat:        [B, feat_ch, 1, H/8, W/8]  — local feature "volume" (D'=1)
+        global_feat: [B, global_ch]              — global context vector
+    """
+
+    def __init__(self, in_ch: int, feat_ch: int = 64,
+                global_ch: int = 64, dilation_xy: int = 1,
+                depth: int = 3):
+        super().__init__()
+        assert depth in (3, 5, 7), f"ResNetEncoder2p5D depth must be 3, 5, or 7, got {depth}"
+        self.depth = depth
+        b = feat_ch // 4
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, b, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(min(8, b), b),
+            nn.ReLU(inplace=True),
+        )                                               # [B, b, H/2, W/2]
+
+        self.layer1 = ResBlock2D(b,     b * 2, stride_xy=1)
+        self.layer2 = ResBlock2D(b * 2, b * 4, stride_xy=2)
+        self.layer3 = ResBlock2D(
+            b * 4, b * 4,
+            stride_xy=1 if dilation_xy > 1 else 2,
+            dilation_xy=dilation_xy,
+        )
+        if depth >= 4:
+            self.layer4 = ResBlock2D(b * 4, b * 4, stride_xy=2)
+        if depth >= 5:
+            self.layer5 = ResBlock2D(b * 4, b * 4, stride_xy=2)
+        if depth >= 6:
+            self.layer6 = ResBlock2D(b * 4, b * 4, stride_xy=2)
+        if depth >= 7:
+            self.layer7 = ResBlock2D(b * 4, b * 4, stride_xy=2)
+
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(b * 4, feat_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(min(8, feat_ch), feat_ch),
+            nn.ReLU(inplace=True),
+        )                                               # [B, feat_ch, H/8, W/8]
+
+        self.global_proj = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(feat_ch, global_ch),
+            nn.ReLU(inplace=True),
+        )
+
+        self.out_ch    = feat_ch
+        self.global_ch = global_ch
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """[B, 1, D, H, W]  →  (feat [B, feat_ch, 1, H/8, W/8],  global_feat [B, global_ch])
+
+        D is squeezed out of the channel-1 axis and treated as input channels
+        (in_ch must equal D, i.e. cfg.patch_z) before any convolution runs.
+        """
+        x = x.squeeze(1)         # [B, 1, D, H, W] -> [B, D, H, W]
+        x = self.stem(x)         # [B, b,  H/2, W/2]
+        x = self.layer1(x)       # [B, 2b, H/2, W/2]
+        x = self.layer2(x)       # [B, 4b, H/4, W/4]
+        x = self.layer3(x)       # [B, 4b, H/8, W/8]  (or H/4 if dilated)
+        if self.depth >= 4:
+            x = self.layer4(x)   # [B, 4b, H/16, W/16]
+        if self.depth >= 5:
+            x = self.layer5(x)   # [B, 4b, H/32, W/32]
+        if self.depth >= 6:
+            x = self.layer6(x)   # [B, 4b, H/64, W/64]
+        if self.depth >= 7:
+            x = self.layer7(x)   # [B, 4b, H/128, W/128]
+        feat2d = self.out_conv(x)        # [B, feat_ch, H/8 (or H/32, H/128), W/8 (or H/32, H/128)]
+        feat   = feat2d.unsqueeze(2)     # [B, feat_ch, 1, H', W'] — D'=1, grid_sample-compatible
+        return feat, self.global_proj(feat2d)
+
+    def forward_deep_multiscale(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Like forward(), but also returns layer1..layer4 for skip connections
+        (Dense2DDecoder(use_skip_connections=True)). Only valid for depth=5 —
+        mirrors ResNetEncoder3D.forward_deep_multiscale, 2D.
+
+        [B, 1, D, H, W]  →  (feat [B, feat_ch, 1, H/32, W/32],
+                              global_feat [B, global_ch],
+                              layer1 [B, 2b, H/2,  W/2],
+                              layer2 [B, 4b, H/4,  W/4],
+                              layer3 [B, 4b, H/8,  W/8],
+                              layer4 [B, 4b, H/16, W/16])
+        """
+        assert self.depth == 5, f"forward_deep_multiscale requires depth=5, got {self.depth}"
+        x    = x.squeeze(1)      # [B, D, H, W]
+        x    = self.stem(x)      # [B, b,  H/2,  W/2]
+        l1   = self.layer1(x)    # [B, 2b, H/2,  W/2]
+        l2   = self.layer2(l1)   # [B, 4b, H/4,  W/4]
+        l3   = self.layer3(l2)   # [B, 4b, H/8,  W/8]
+        l4   = self.layer4(l3)   # [B, 4b, H/16, W/16]
+        x    = self.layer5(l4)   # [B, 4b, H/32, W/32]
+        feat2d = self.out_conv(x)
+        feat   = feat2d.unsqueeze(2)
+        return feat, self.global_proj(feat2d), l1, l2, l3, l4
+
+
+# ---------------------------------------------------------------------------
 # Symmetric dense decoder (diagnostic — no skip connections)
 # ---------------------------------------------------------------------------
 
@@ -562,6 +712,128 @@ class DenseDecoder3D(nn.Module):
         else:
             x = self.up2(x)
             x = self.mid(x)
+        x = self.up1(x)
+        return self.head(x)
+
+
+# ---------------------------------------------------------------------------
+# 2D dense decoder for ResNetEncoder2p5D (2.5D Residual U-Net baseline)
+# ---------------------------------------------------------------------------
+
+class DecBlock2D(nn.Module):
+    """DecBlock3D with the Z axis removed — upsample (bilinear) then conv."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(min(8, out_ch), out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        return self.conv(x)
+
+
+class Dense2DDecoder(nn.Module):
+    """Symmetric upsampling decoder for ResNetEncoder2p5D.
+
+    use_skip_connections=False (default): no skip connections — mirrors
+    DenseDecoder3D's no-skip path, but (unlike DenseDecoder3D, which only
+    implements that path for depth=3) generalizes across depth in {3, 5, 7}
+    with `depth - 3` extra stages, exactly matching ResNetEncoder2p5D's own
+    `if depth >= 4/5/6/7` pattern.
+
+    use_skip_connections=True: real U-Net-style skip connections, depth=5
+    only (mirrors DenseDecoder3D's depth=5 skip path, 2D) — concatenates
+    layer4 (H/16), layer3 (H/8), layer2 (H/4), layer1 (H/2) from
+    ResNetEncoder2p5D.forward_deep_multiscale at each matching-resolution
+    upsampling stage before a fusion conv. forward(feat2d, layer1, layer2,
+    layer3, layer4) — all four required.
+    """
+
+    def __init__(self, feat_ch: int, num_classes: int, depth: int = 3,
+                 use_skip_connections: bool = False):
+        super().__init__()
+        assert depth in (3, 5, 7), f"Dense2DDecoder depth must be 3, 5, or 7, got {depth}"
+        assert not use_skip_connections or depth == 5, \
+            "Dense2DDecoder(use_skip_connections=True) requires depth=5 (no other depth implemented)"
+        b = feat_ch // 4
+        self.use_skip = use_skip_connections
+        self.depth    = depth
+
+        if use_skip_connections:
+            # Each stage upsamples at a CONSTANT channel width, concatenates the
+            # same-resolution skip, then the fuse conv reduces channels for the
+            # next stage — mirrors DenseDecoder3D's actual skip pattern (channel
+            # reduction happens in the fuse conv, not in the upsample itself).
+            # layer1: 2b, layer2/3/4: 4b (same widths ResNetEncoder2p5D produces).
+            self.up_l4 = DecBlock2D(4 * b, 4 * b)   # H/32 -> H/16, stays 4b
+            self.fuse_l4 = nn.Sequential(
+                nn.Conv2d(4 * b + 4 * b, 4 * b, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(min(8, 4 * b), 4 * b), nn.ReLU(inplace=True),
+            )
+            self.up3 = DecBlock2D(4 * b, 4 * b)     # H/16 -> H/8, stays 4b
+            self.fuse_l3 = nn.Sequential(
+                nn.Conv2d(4 * b + 4 * b, 4 * b, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(min(8, 4 * b), 4 * b), nn.ReLU(inplace=True),
+            )
+            self.up2 = DecBlock2D(4 * b, 4 * b)     # H/8 -> H/4, stays 4b
+            self.fuse_l2 = nn.Sequential(
+                nn.Conv2d(4 * b + 4 * b, 2 * b, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(min(8, 2 * b), 2 * b), nn.ReLU(inplace=True),
+            )
+            self.up1 = DecBlock2D(2 * b, 2 * b)     # H/4 -> H/2, stays 2b
+            self.fuse_l1 = nn.Sequential(
+                nn.Conv2d(2 * b + 2 * b, b, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(min(8, b), b), nn.ReLU(inplace=True),
+            )
+            self.up_stem = DecBlock2D(b, b)         # H/2 -> H, stays b
+            self.head = nn.Conv2d(b, num_classes, kernel_size=1)
+        else:
+            # Extra stages mirroring the encoder's layer4..layer7 (each 4b -> 4b, no skip).
+            self.extra = nn.ModuleList([DecBlock2D(4 * b, 4 * b) for _ in range(depth - 3)])
+
+            self.up3 = DecBlock2D(4 * b, 4 * b)   # mirrors layer3
+            self.up2 = DecBlock2D(4 * b, 2 * b)   # mirrors layer2
+            self.mid = nn.Sequential(              # no upsample, mirrors layer1 (b->2b reversed)
+                nn.Conv2d(2 * b, b, kernel_size=3, padding=1, bias=False),
+                nn.GroupNorm(min(8, b), b),
+                nn.ReLU(inplace=True),
+            )
+            self.up1  = DecBlock2D(b, b)           # mirrors the stem
+            self.head = nn.Conv2d(b, num_classes, kernel_size=1)
+
+    def forward(
+        self,
+        feat2d: torch.Tensor,
+        layer1: Optional[torch.Tensor] = None,   # [B, 2b, H/2,  W/2]  — required if use_skip_connections
+        layer2: Optional[torch.Tensor] = None,   # [B, 4b, H/4,  W/4]
+        layer3: Optional[torch.Tensor] = None,   # [B, 4b, H/8,  W/8]
+        layer4: Optional[torch.Tensor] = None,   # [B, 4b, H/16, W/16]
+    ) -> torch.Tensor:
+        """[B, feat_ch, H/8 (or H/32, H/128), W/...]  ->  [B, num_classes, H, W]"""
+        if self.use_skip:
+            assert layer1 is not None and layer2 is not None and layer3 is not None and layer4 is not None, \
+                "Dense2DDecoder(use_skip_connections=True) requires layer1..layer4"
+            x = self.up_l4(feat2d)
+            x = self.fuse_l4(torch.cat([x, layer4], dim=1))
+            x = self.up3(x)
+            x = self.fuse_l3(torch.cat([x, layer3], dim=1))
+            x = self.up2(x)
+            x = self.fuse_l2(torch.cat([x, layer2], dim=1))
+            x = self.up1(x)
+            x = self.fuse_l1(torch.cat([x, layer1], dim=1))
+            x = self.up_stem(x)
+            return self.head(x)
+
+        x = feat2d
+        for stage in self.extra:
+            x = stage(x)
+        x = self.up3(x)
+        x = self.up2(x)
+        x = self.mid(x)
         x = self.up1(x)
         return self.head(x)
 
@@ -776,13 +1048,21 @@ class ConditionalINR(nn.Module):
                 # (layer3-5 preserve channel count, unlike layer1->layer2).
                 cond_dim += 2 * cfg.encoder_feat
 
-        self.encoder = ResNetEncoder3D(
-            in_ch=1, feat_ch=cfg.encoder_feat,
-            global_ch=cfg.global_feat_ch,
-            dilation_xy=cfg.dilation_xy,
-            z_strides=cfg.encoder_z_strides,
-            depth=cfg.encoder_depth,
-        )
+        if cfg.encoder_type == "2.5d":
+            self.encoder = ResNetEncoder2p5D(
+                in_ch=cfg.patch_z, feat_ch=cfg.encoder_feat,
+                global_ch=cfg.global_feat_ch,
+                dilation_xy=cfg.dilation_xy,
+                depth=cfg.encoder_depth,
+            )
+        else:
+            self.encoder = ResNetEncoder3D(
+                in_ch=1, feat_ch=cfg.encoder_feat,
+                global_ch=cfg.global_feat_ch,
+                dilation_xy=cfg.dilation_xy,
+                z_strides=cfg.encoder_z_strides,
+                depth=cfg.encoder_depth,
+            )
 
         if self.use_film:
             # SIREN: raw coords → FiLM-conditioned sinusoidal MLP
@@ -909,3 +1189,56 @@ class ConditionalINR(nn.Module):
                                    layer1=layer1, layer2=layer2)
         feat_vol, global_feat = self.encoder(volume)
         return self.decode_3d(feat_vol, global_feat, coords, (D, H, W), return_feat_logits)
+
+
+# ---------------------------------------------------------------------------
+# 2.5D Residual U-Net baseline (dense prediction, no INR/coordinate decoding)
+# ---------------------------------------------------------------------------
+
+class ResidualUNet2p5D(nn.Module):
+    """2.5D encoder (patch_z frames as input channels) + dense 2D decoder.
+
+    Predicts a single [num_classes, H, W] map for the central frame of the
+    patch window only — the only frame with real supervision in most windows
+    anyway (see dataset.py's window-centering: the annotated frame lands at
+    local index patch_z // 2 in the common, non-boundary-clipped case).
+
+    Baseline to compare against a ConditionalINR run with encoder_type="2.5d":
+    same ResNetEncoder2p5D construction (same cfg fields), only the decoder
+    differs (this dense conv decoder vs the INR's coordinate-sampled MLP).
+
+    cfg.dense_decoder_skip_connections (same flag the 3D diagnostic dense
+    decoder uses) toggles real U-Net-style skip connections on this decoder
+    — off by default, since the no-skip version is what keeps this a
+    decoder-only-difference comparison against the INR (which also never
+    sees multi-scale features, only the final feature map). Skip
+    connections require encoder_depth=5 (forward_deep_multiscale).
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.use_skip = cfg.dense_decoder_skip_connections
+        if self.use_skip:
+            assert cfg.encoder_depth == 5, \
+                "ResidualUNet2p5D skip connections require encoder_depth=5"
+        self.encoder = ResNetEncoder2p5D(
+            in_ch=cfg.patch_z, feat_ch=cfg.encoder_feat,
+            global_ch=cfg.global_feat_ch,
+            dilation_xy=cfg.dilation_xy,
+            depth=cfg.encoder_depth,
+        )
+        self.dense_decoder = Dense2DDecoder(
+            cfg.encoder_feat, cfg.num_classes, depth=cfg.encoder_depth,
+            use_skip_connections=self.use_skip,
+        )
+
+    def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        """[B, 1, patch_z, H, W]  ->  [B, num_classes, H, W]"""
+        if self.use_skip:
+            feat, _, l1, l2, l3, l4 = self.encoder.forward_deep_multiscale(volume)
+            feat2d = feat.squeeze(2)
+            return self.dense_decoder(feat2d, layer1=l1, layer2=l2, layer3=l3, layer4=l4)
+        feat, _ = self.encoder(volume)     # feat: [B, feat_ch, 1, H/8 (or H/32, H/128), W/...]
+        feat2d = feat.squeeze(2)           # drop the D'=1 axis
+        return self.dense_decoder(feat2d)

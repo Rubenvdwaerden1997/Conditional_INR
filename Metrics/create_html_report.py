@@ -14,6 +14,16 @@ single very large, hard-to-browse PDF. Instead this script:
   - lets you browse pullback -> frame in the browser (click, or arrow keys),
     with a quick per-frame Dice badge to help you jump straight to the worst
     predictions.
+  - also builds a rotating longitudinal ("L-mode") view per pullback: for a
+    set of rotation angles around the pullback axis, it takes the diameter
+    line through each frame's center and stacks those across every z-frame
+    into one 2D image. This uses the full 3D prediction (not just annotated
+    frames), so it's the way to check whether predictions stay consistent
+    along the length of a pullback rather than flickering frame-to-frame.
+    Toggle it with the "Longitudinal view" button in the report (prediction
+    only -- no GT longitudinal, since GT is only annotated at sparse frames).
+    Disable with --no_longitudinal, or change the rotation granularity with
+    --long_angle_step (default 15 deg -> 12 angles spanning 0-165 deg).
 
 It does NOT run inference itself -- it reads the .nii.gz predictions already
 written by Pullback_prediction.py (in <model_dir>/test_metrics/predictions),
@@ -238,6 +248,71 @@ def frame_mean_dice(gt: np.ndarray, pred: np.ndarray, num_classes: int) -> float
 
 
 # -----------------------------
+# Longitudinal (L-mode) view
+# -----------------------------
+# A pullback frame is a circular cross-section with the catheter at its center. Rotating
+# the frame by `angle_deg` around that center and reading off the row through the middle
+# is equivalent to sampling the *original* frame along a diameter line at that angle --
+# the same construction IVUS/OCT consoles use for their longitudinal ("L-mode") pullback
+# view. Stacking that line across every z-frame gives one 2D image (z vertical, diameter
+# horizontal) that makes frame-to-frame (in)consistency of the 3D prediction visible at a
+# glance, which a per-frame-only report can't show.
+def extract_diameter_line(frame2d: np.ndarray, angle_deg: float, is_label: bool) -> np.ndarray:
+    h, w = frame2d.shape
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    interp = cv2.INTER_NEAREST if is_label else cv2.INTER_LINEAR
+    rotated = cv2.warpAffine(frame2d.astype(np.float32), M, (w, h), flags=interp, borderValue=0.0)
+    line = rotated[h // 2, :]
+    return np.rint(line).astype(np.int64) if is_label else line
+
+
+def build_longitudinal_images(
+    volume: np.ndarray,
+    pred: np.ndarray,
+    angles: List[int],
+    colors: List[Tuple[int, int, int]],
+    alpha: float,
+    pid: str,
+    out_dir: Path,
+    jpeg_quality: int,
+) -> List[dict]:
+    """volume/pred: full [D,H,W] pullback (all z, not just annotated frames) -- the
+    prediction is a continuous 3D field regardless of where GT annotations happen to be."""
+    D, H, W = volume.shape
+    entries = []
+    for angle in angles:
+        raw_lines = np.zeros((D, W), dtype=np.float32)
+        pred_lines = np.zeros((D, W), dtype=np.int64)
+        for z in range(D):
+            raw_lines[z] = extract_diameter_line(volume[z], angle, is_label=False)
+            pred_lines[z] = extract_diameter_line(pred[z], angle, is_label=True)
+
+        # Transpose so the pullback (z) axis runs horizontally and the diameter axis
+        # runs vertically -- stretches the L-mode image out wide instead of tall, which
+        # is how IVUS/OCT consoles display it and is much easier to scan frame-to-frame.
+        raw_lines = raw_lines.T
+        pred_lines = pred_lines.T
+
+        raw_rgb = np.stack([to_uint8_display(raw_lines)] * 3, axis=-1)
+        colored_pred = colorize(pred_lines, colors)
+        overlay_pred = blend_overlay(raw_rgb, colored_pred, pred_lines > 0, alpha)
+
+        raw_name = f"long_angle{angle:03d}_raw.jpg"
+        pred_name = f"long_angle{angle:03d}_pred.jpg"
+        save_jpg(raw_rgb, out_dir / raw_name, jpeg_quality)
+        save_jpg(overlay_pred, out_dir / pred_name, jpeg_quality)
+
+        entries.append({
+            "pullback": pid,
+            "angle": angle,
+            "raw": f"images/{pid}/{raw_name}",
+            "pred": f"images/{pid}/{pred_name}",
+        })
+    return entries
+
+
+# -----------------------------
 # HTML report
 # -----------------------------
 _HTML_TEMPLATE = """<!DOCTYPE html>
@@ -268,6 +343,12 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   }
   #topbar .title { font-size: 15px; font-weight: 600; }
   #topbar .stat { font-size: 12px; color: #9aa0aa; }
+  #modeToggle { display: flex; gap: 4px; background: #262a32; border-radius: 6px; padding: 3px; }
+  #modeToggle button {
+    border: none; background: transparent; color: #9aa0aa; font-size: 12px; padding: 5px 10px;
+    border-radius: 4px; cursor: pointer;
+  }
+  #modeToggle button.active { background: #2f5d8f; color: #fff; }
   #frameStrip { display: flex; gap: 4px; padding: 8px 16px; overflow-x: auto; background: #17191f; border-bottom: 1px solid #2c2f36; }
   .frame-btn {
     min-width: 42px; padding: 5px 6px; text-align: center; border-radius: 5px; font-size: 12px;
@@ -277,10 +358,14 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .frame-btn.active { background: #2f5d8f; color: #fff; }
   .frame-btn .d { display: block; font-size: 10px; margin-top: 1px; }
   .dice-good { color: #6fe08a; } .dice-mid { color: #f0c95a; } .dice-bad { color: #f0705a; }
-  #viewer { flex: 1; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 14px; overflow: auto; }
+  #viewer { flex: 1; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 14px; overflow: auto; min-height: 0; }
+  #viewer.long-mode { flex-direction: column; gap: 16px; align-items: stretch; justify-content: flex-start; overflow: hidden; }
   .panel { flex: 1; max-width: 33%; text-align: center; }
+  .panel.wide { max-width: 100%; width: 100%; flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+  .panel.hidden { display: none; }
   .panel img { max-width: 100%; max-height: 70vh; border-radius: 6px; background: #000; border: 1px solid #2c2f36; }
-  .panel .label { font-size: 12px; color: #9aa0aa; margin-top: 6px; }
+  .panel.wide img { flex: 1; min-height: 0; width: 100%; height: 100%; max-height: none; object-fit: fill; }
+  .panel .label { font-size: 12px; color: #9aa0aa; margin-top: 6px; flex: none; }
   #legend { padding: 8px 16px; border-top: 1px solid #2c2f36; background: #1b1e24; display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; color: #cdd2da; }
   .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
   #navHint { font-size: 11px; color: #6b7280; margin-left: auto; }
@@ -295,19 +380,24 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <div id="topbar">
       <div class="title" id="titleText">--</div>
       <div class="stat" id="statText"></div>
-      <div id="navHint">&larr; / &rarr; = prev/next frame</div>
+      <div id="modeToggle">
+        <button id="modeFrameBtn">Frame view</button>
+        <button id="modeLongBtn">Longitudinal view</button>
+      </div>
+      <div id="navHint">&larr; / &rarr; = prev/next</div>
     </div>
     <div id="frameStrip"></div>
     <div id="viewer">
-      <div class="panel"><img id="imgRaw"><div class="label">OCT frame</div></div>
-      <div class="panel"><img id="imgGt"><div class="label">Ground truth</div></div>
-      <div class="panel"><img id="imgPred"><div class="label">Prediction</div></div>
+      <div class="panel" id="panelRaw"><img id="imgRaw"><div class="label" id="labelRaw">OCT frame</div></div>
+      <div class="panel" id="panelGt"><img id="imgGt"><div class="label">Ground truth</div></div>
+      <div class="panel" id="panelPred"><img id="imgPred"><div class="label" id="labelPred">Prediction</div></div>
     </div>
     <div id="legend"></div>
   </div>
 
 <script>
 const MANIFEST = __MANIFEST_JSON__;
+const LONG_MANIFEST = __LONG_MANIFEST_JSON__;
 const CLASS_NAMES = __CLASS_NAMES_JSON__;
 const CLASS_COLORS = __CLASS_COLORS_JSON__;
 
@@ -315,10 +405,16 @@ const byPullback = {};
 for (const row of MANIFEST) {
   (byPullback[row.pullback] = byPullback[row.pullback] || []).push(row);
 }
+const byPullbackLong = {};
+for (const row of LONG_MANIFEST) {
+  (byPullbackLong[row.pullback] = byPullbackLong[row.pullback] || []).push(row);
+}
 const pullbackIds = Object.keys(byPullback);
+const hasLongitudinal = LONG_MANIFEST.length > 0;
 
+let mode = 'frame';   // 'frame' | 'long'
 let curPullback = pullbackIds[0];
-let curIdx = 0;
+let curIdx = 0;       // index into byPullback[curPullback] (frame mode) or byPullbackLong[curPullback] (long mode)
 
 function diceClass(d) {
   if (d === null || isNaN(d)) return '';
@@ -328,13 +424,18 @@ function diceClass(d) {
 }
 function fmtDice(d) { return (d === null || isNaN(d)) ? 'n/a' : d.toFixed(2); }
 
+function curRows() {
+  return mode === 'long' ? (byPullbackLong[curPullback] || []) : (byPullback[curPullback] || []);
+}
+
 function renderSidebar() {
   const el = document.getElementById('pullbackList');
   el.innerHTML = '';
   for (const pid of pullbackIds) {
     const div = document.createElement('div');
     div.className = 'pullback-item' + (pid === curPullback ? ' active' : '');
-    div.innerHTML = pid + '<span class="count">' + byPullback[pid].length + '</span>';
+    const count = mode === 'long' ? (byPullbackLong[pid] || []).length : byPullback[pid].length;
+    div.innerHTML = pid + '<span class="count">' + count + '</span>';
     div.onclick = () => { curPullback = pid; curIdx = 0; render(); };
     el.appendChild(div);
   }
@@ -343,10 +444,14 @@ function renderSidebar() {
 function renderFrameStrip() {
   const el = document.getElementById('frameStrip');
   el.innerHTML = '';
-  byPullback[curPullback].forEach((row, i) => {
+  curRows().forEach((row, i) => {
     const div = document.createElement('div');
     div.className = 'frame-btn' + (i === curIdx ? ' active' : '');
-    div.innerHTML = row.frame + '<span class="d ' + diceClass(row.dice) + '">' + fmtDice(row.dice) + '</span>';
+    if (mode === 'long') {
+      div.innerHTML = row.angle + '&deg;';
+    } else {
+      div.innerHTML = row.frame + '<span class="d ' + diceClass(row.dice) + '">' + fmtDice(row.dice) + '</span>';
+    }
     div.onclick = () => { curIdx = i; render(); };
     el.appendChild(div);
   });
@@ -363,37 +468,70 @@ function renderLegend() {
   });
 }
 
+function setMode(newMode) {
+  if (newMode === 'long' && !hasLongitudinal) return;
+  mode = newMode;
+  curIdx = 0;
+  document.getElementById('modeFrameBtn').className = mode === 'frame' ? 'active' : '';
+  document.getElementById('modeLongBtn').className = mode === 'long' ? 'active' : '';
+  document.getElementById('panelGt').className = 'panel' + (mode === 'long' ? ' hidden' : '');
+  document.getElementById('panelRaw').className = 'panel' + (mode === 'long' ? ' wide' : '');
+  document.getElementById('panelPred').className = 'panel' + (mode === 'long' ? ' wide' : '');
+  document.getElementById('viewer').className = mode === 'long' ? 'long-mode' : '';
+  document.getElementById('labelRaw').textContent = mode === 'long' ? 'OCT (longitudinal)' : 'OCT frame';
+  document.getElementById('labelPred').textContent = mode === 'long' ? 'Prediction (longitudinal)' : 'Prediction';
+  render();
+}
+
 function render() {
-  const rows = byPullback[curPullback];
+  const rows = curRows();
+  if (rows.length === 0) { renderSidebar(); renderFrameStrip(); return; }
   const row = rows[curIdx];
   document.getElementById('imgRaw').src = row.raw;
-  document.getElementById('imgGt').src = row.gt;
   document.getElementById('imgPred').src = row.pred;
-  document.getElementById('titleText').textContent = curPullback + ' -- frame ' + row.frame;
-  document.getElementById('statText').textContent =
-    'Frame ' + (curIdx + 1) + ' / ' + rows.length + '   |   Dice (excl. bg): ' + fmtDice(row.dice);
+  if (mode === 'long') {
+    document.getElementById('titleText').textContent = curPullback + ' -- rotation ' + row.angle + '°';
+    document.getElementById('statText').textContent =
+      'Angle ' + (curIdx + 1) + ' / ' + rows.length + ' (' + row.angle + '° diameter cut through pullback axis)';
+  } else {
+    document.getElementById('imgGt').src = row.gt;
+    document.getElementById('titleText').textContent = curPullback + ' -- frame ' + row.frame;
+    document.getElementById('statText').textContent =
+      'Frame ' + (curIdx + 1) + ' / ' + rows.length + '   |   Dice (excl. bg): ' + fmtDice(row.dice);
+  }
   renderSidebar();
   renderFrameStrip();
 }
 
+document.getElementById('modeFrameBtn').onclick = () => setMode('frame');
+document.getElementById('modeLongBtn').onclick = () => setMode('long');
+if (!hasLongitudinal) { document.getElementById('modeLongBtn').style.display = 'none'; }
+
 document.addEventListener('keydown', (e) => {
-  const rows = byPullback[curPullback];
+  const rows = curRows();
   if (e.key === 'ArrowRight') { curIdx = Math.min(curIdx + 1, rows.length - 1); render(); }
   else if (e.key === 'ArrowLeft') { curIdx = Math.max(curIdx - 1, 0); render(); }
 });
 
 renderLegend();
-render();
+setMode('frame');
 </script>
 </body>
 </html>
 """
 
 
-def build_html(manifest: List[dict], class_names: List[str], class_colors: List[Tuple[int, int, int]], out_path: Path) -> None:
+def build_html(
+    manifest: List[dict],
+    long_manifest: List[dict],
+    class_names: List[str],
+    class_colors: List[Tuple[int, int, int]],
+    out_path: Path,
+) -> None:
     html = (
         _HTML_TEMPLATE
         .replace("__MANIFEST_JSON__", json.dumps(manifest))
+        .replace("__LONG_MANIFEST_JSON__", json.dumps(long_manifest))
         .replace("__CLASS_NAMES_JSON__", json.dumps(class_names))
         .replace("__CLASS_COLORS_JSON__", json.dumps(class_colors))
     )
@@ -415,6 +553,11 @@ def main():
     parser.add_argument("--jpeg_quality", type=int, default=90)
     parser.add_argument("--max_pullbacks", type=int, default=None, help="Only process the first N test pullbacks (debugging)")
     parser.add_argument("--pullbacks", type=str, nargs="+", default=None, help="Only process these specific pullback IDs")
+    parser.add_argument("--no_longitudinal", action="store_true",
+                         help="Skip building the rotating longitudinal (L-mode) prediction view (on by default)")
+    parser.add_argument("--long_angle_step", type=int, default=15,
+                         help="Degrees between longitudinal rotation angles, spanning 0-165 deg (default 15 -> 12 angles). "
+                              "A diameter cut at angle a is identical to the one at a+180, so only 0-180 is needed.")
     parser.add_argument("--eval_resolution", type=str, default="native", choices=["native", "encoder"],
                          help="Must match the --eval_resolution Pullback_prediction.py used to generate these "
                               "predictions. 'native' (default): predictions and ground truth are both native "
@@ -473,6 +616,7 @@ def main():
     class_colors = get_class_colors(num_classes)
 
     manifest: List[dict] = []
+    long_manifest: List[dict] = []
     n_done = 0
     for pid, ann_frames in pullback_to_frames.items():
         npz_path = find_pullback_npz(pid, data_roots)
@@ -562,6 +706,14 @@ def main():
                 "pred": f"images/{pid}/{pred_name}",
             })
 
+        if not args.no_longitudinal:
+            angles = list(range(0, 180, args.long_angle_step))
+            long_entries = build_longitudinal_images(
+                volume_eval, pred, angles, class_colors, args.alpha, pid, pid_img_dir, args.jpeg_quality,
+            )
+            long_manifest.extend(long_entries)
+            print(f"    + longitudinal view: {len(angles)} angles x {volume_eval.shape[0]} frames")
+
         n_done += 1
         print(f"[{n_done}/{len(pullback_to_frames)}] {pid}: {len(valid_frames)} frames rendered")
 
@@ -570,7 +722,7 @@ def main():
         return
 
     report_path = output_dir / report_name
-    build_html(manifest, class_names, class_colors, report_path)
+    build_html(manifest, long_manifest, class_names, class_colors, report_path)
     print(f"\n[INFO] Wrote {report_path} ({len(manifest)} frames across {n_done} pullbacks)")
     print(f"[INFO] Open it directly in a browser (file://{report_path.resolve()})")
 
