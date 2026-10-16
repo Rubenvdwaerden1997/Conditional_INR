@@ -5,26 +5,29 @@
 #SBATCH --mem=40G
 #SBATCH --time=48:00:00
 #SBATCH --container-mounts=/data/diag:/data/diag
-#SBATCH --container-image="dockerdex.umcn.nl:5005#rubenvdwaerden1997/train_monai:v1.4"
+#SBATCH --container-image="dockerdex.umcn.nl:5005#rubenvdwaerden1997/train_monai:v1.6"
 #SBATCH -o ./slurm_output/_slurm_output_metrics_%j.txt
 #SBATCH -e ./slurm_output/_slurm_error_metrics_%j.txt
 #SBATCH --qos=low
-#SBATCH --exclude=dlc-mewtwo,dlc-moltres,dlc-nidoking,dlc-scyther,dlc-lugia,dlc-zapdos
 
 cd /data/diag/rubenvdw/Conditional_INR/Metrics
 
-# pandas/openpyxl -> reading the split .xlsx; scikit-image -> only exercised if POSTPROCESS=true below;
-# opencv-python-headless -> Pullback_prediction.py now imports create_html_report.py's JPEG helpers at
-# module load time regardless of HTML_REPORT below, so cv2 is an unconditional dependency here.
-pip install -U pandas openpyxl scikit-image opencv-python-headless
+# v1.6 already bakes in pandas/openpyxl (see Dockerfile_initiation/requirements.txt), but that
+# file only covers what Training_model/*.py imports -- scikit-image and opencv-python-headless
+# are Metrics-specific (postprocessing/HTML-report) and were never part of that pinned set, so
+# they still need installing here.
+pip install -U scikit-image opencv-python-headless
 
 echo "Running on GPU node: $(hostname)"
 
-MODEL_DIR="/data/diag/rubenvdw/Conditional_INR/saved_models_3D_conditional/conditional_3D_relu_cedice_trilinear_encoder64_depth5_nodense_foregroundnorm_widehidden256"
+MODEL_DIR="/data/diag/rubenvdw/Conditional_INR/saved_models_2p5D_conditional/conditional_3D_relu_cedice_trilinear_encoder32_depth5_nodense_2p5d_foregroundnorm_perpullbacknorm_zjitter_perframe"
 CHECKPOINT="best"     # best | latest
 OVERLAP=0.5           # sliding z-patch overlap fraction [0.0-1.0]
 POSTPROCESS=true     # true -> apply small-region cleanup before scoring
 HTML_REPORT=true      # true -> also render the OCT|GT|prediction HTML QC report (see create_html_report.py)
+SKIP_EXISTING=false   # true -> reuse a pullback's prediction .nii.gz if already present (e.g. restarting
+                       # after a crash, or just re-running with different metrics/report options) instead of
+                       # recomputing every prediction from scratch. false -> always recompute (previous behaviour).
 EVAL_RESOLUTION=native  # "native": query the INR at native resolution, score against native ground
                         # truth. "encoder": query at the model's own encoder input resolution
                         # (cfg.resize_to) instead, scoring against nearest-neighbour-downsampled ground
@@ -61,6 +64,9 @@ if [ "$POSTPROCESS" = true ]; then
 fi
 if [ "$HTML_REPORT" = true ]; then
     ARGS+=(--html_report)
+fi
+if [ "$SKIP_EXISTING" = true ]; then
+    ARGS+=(--skip_existing_predictions)
 fi
 
 python3 -u Pullback_prediction.py "${ARGS[@]}"

@@ -43,7 +43,7 @@ Usage:
 --eval_resolution must match whatever Pullback_prediction.py was run with for these
 predictions: "native" (default) reads native-resolution predictions and ground truth;
 "encoder" reads predictions saved at the model's own encoder input resolution
-(cfg.resize_to) and downsamples the ground truth to match before rendering. Output
+(the yaml's training_segmentation.resize_to) and downsamples the ground truth to match before rendering. Output
 lands in a resolution-specific folder/filename (see below) so the two never collide.
 """
 import argparse
@@ -61,20 +61,24 @@ import yaml
 import cv2
 
 # Only needed for --eval_resolution=encoder (downsampling ground truth/raw image to
-# cfg.resize_to before rendering) and to read cfg.resize_to itself -- reuses the exact
-# same resize_labels/resize_volume Pullback_prediction.py and training use, rather than
-# reimplementing a second, possibly-divergent resize here. CPU-only (no GPU needed for
-# these two functions), so this doesn't change the "no --gpus-per-task" note in
-# create_html_report.sh -- it does mean torch must be importable in whatever
-# environment runs this script (already true in the train_monai container the .sh
-# script uses).
+# resize_to before rendering) -- reuses the exact same resize_labels/resize_volume
+# Pullback_prediction.py and training use, rather than reimplementing a second,
+# possibly-divergent resize here. CPU-only (no GPU needed for these two functions), so
+# this doesn't change the "no --gpus-per-task" note in create_html_report.sh -- it does
+# mean torch must be importable in whatever environment runs this script (already true
+# in the train_monai container the .sh script uses).
+#
+# Deliberately model-agnostic: this script never builds a ConditionalINR- or
+# ResidualUNet2p5D-specific Config at all (it used to, via build_config_from_yaml, which
+# made it silently INR-only) -- the only field it ever needed from one is resize_to,
+# read directly from the yaml below instead, so the same script works for predictions
+# from either model type.
 _CONDITIONAL_INR_REPO_LOCAL   = Path("W:/rubenvdw/Conditional_INR")
 _CONDITIONAL_INR_REPO_CLUSTER = Path("/data/diag/rubenvdw/Conditional_INR")
 for _repo_root in (_CONDITIONAL_INR_REPO_LOCAL, _CONDITIONAL_INR_REPO_CLUSTER):
     sys.path.insert(0, str(_repo_root / "Training_model"))
     sys.path.insert(0, str(_repo_root))
 from model import resize_labels, resize_volume                     # Training_model/model.py
-from predict_singlepullback_conditional import build_config_from_yaml
 
 # Mirrors Pullback_prediction.py's class-name convention (post label-mapping,
 # 12-class taxonomy) -- duplicated rather than imported so this script stays
@@ -187,6 +191,15 @@ def find_pred_file(pid: str, pred_dir: Path, overlap: float, use_postprocessed: 
         chosen = preferred[0] if preferred else candidates[0]
         print(f"[WARN] {pid}: exact overlap={overlap} prediction not found, using {chosen.name} instead")
         return chosen
+    # ResidualUNet2p5D predictions (Pullback_prediction_unet.py) have no overlap concept
+    # (one forward pass per frame, nothing to accumulate), so they're saved without an
+    # "_overlap<N>" suffix at all: "{pid}_pred.nii.gz" / "{pid}_pred_postprocessed.nii.gz".
+    plain_raw      = pred_dir / f"{pid}_pred.nii.gz"
+    plain_postproc = pred_dir / f"{pid}_pred_postprocessed.nii.gz"
+    if use_postprocessed and plain_postproc.exists():
+        return plain_postproc
+    if plain_raw.exists():
+        return plain_raw
     return None
 
 
@@ -562,7 +575,7 @@ def main():
                          help="Must match the --eval_resolution Pullback_prediction.py used to generate these "
                               "predictions. 'native' (default): predictions and ground truth are both native "
                               "resolution, unchanged behaviour. 'encoder': predictions are at the model's own "
-                              "encoder input resolution (cfg.resize_to) -- ground truth (and the raw OCT image) "
+                              "encoder input resolution -- ground truth (and the raw OCT image) "
                               "are downsampled to match (nearest-neighbour for labels, bilinear for the image, "
                               "same functions training/Pullback_prediction.py use) before rendering.")
     args = parser.parse_args()
@@ -575,7 +588,7 @@ def main():
         yml = yaml.safe_load(f)
     if args.env:
         yml["env"] = args.env
-    cfg = build_config_from_yaml(yml)
+    resize_to = yml.get("training_segmentation", {}).get("resize_to", 0)
 
     # Mirrors Pullback_prediction.py's own output-folder naming exactly (overlap suffix,
     # plus "_encoderres" for --eval_resolution=encoder) so this script's default pred_dir
@@ -650,10 +663,10 @@ def main():
         # Same eval_resolution="encoder" ground-truth downsampling as Pullback_prediction.py:
         # nearest-neighbour for labels (crisp boundaries, no invented intermediate classes),
         # bilinear for the raw image (rendering only). No-op for "native" or when
-        # cfg.resize_to == 0 (e.g. the native704 model has nothing to downsample to).
-        if args.eval_resolution == "encoder" and cfg.resize_to:
-            seg_eval    = resize_labels(torch.from_numpy(seg), cfg.resize_to).numpy()
-            volume_eval = resize_volume(torch.from_numpy(volume), cfg.resize_to).numpy()
+        # resize_to == 0 (e.g. the native704 model has nothing to downsample to).
+        if args.eval_resolution == "encoder" and resize_to:
+            seg_eval    = resize_labels(torch.from_numpy(seg), resize_to).numpy()
+            volume_eval = resize_volume(torch.from_numpy(volume), resize_to).numpy()
         else:
             seg_eval    = seg
             volume_eval = volume
@@ -661,7 +674,7 @@ def main():
         pred = sitk.GetArrayFromImage(sitk.ReadImage(str(pred_path)))  # [D,H,W]
         assert pred.shape[1:] == seg_eval.shape[1:], (
             f"{pid}: pred grid {pred.shape[1:]} != ground-truth grid {seg_eval.shape[1:]} "
-            f"(eval_resolution={args.eval_resolution}, cfg.resize_to={cfg.resize_to}) -- "
+            f"(eval_resolution={args.eval_resolution}, resize_to={resize_to}) -- "
             f"was {pred_path.name} generated with --eval_resolution {args.eval_resolution}?"
         )
 

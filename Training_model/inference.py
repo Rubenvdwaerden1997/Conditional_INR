@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 from config import Config
-from model import ConditionalINR, UnconditionalINR
+from model import ConditionalINR, ResidualUNet2p5D, ResidualUNet3D, UnconditionalINR
 
 
 @torch.no_grad()
@@ -160,6 +160,107 @@ def predict_pullback(
         patch_logits = patch_logits_gpu.cpu().numpy()   # single sync point per patch
 
         logit_sum[z_start:z_end] += patch_logits.reshape(pz, qH, qW, C)[:actual_len]
+        z_start += stride
+
+    return logit_sum.argmax(axis=-1).astype(np.int64)
+
+
+@torch.no_grad()
+def predict_pullback_unet(
+    model:  ResidualUNet2p5D,
+    volume: np.ndarray,        # [D, H, W] float32, z-score normalised
+    cfg:    Config,
+    device: torch.device,
+) -> np.ndarray:                # [D, H, W] int64 class predictions
+    """Dense segmentation of a full pullback, one frame at a time.
+
+    Unlike predict_pullback (ConditionalINR), ResidualUNet2p5D.forward() has no
+    coordinate query — one forward pass on a patch_z-frame window always returns
+    exactly one [C, H, W] map, trained to match whichever frame in the window is
+    annotated (dataset.py's z-jitter puts that frame at a random local index
+    during training; at validation/inference time it's always centred — see
+    dataset.py's `_load_3d_patch`/`__getitem__` eval-mode z_start formula). So,
+    to predict every frame z in the pullback: build a patch_z window centred on
+    z with the SAME clipping convention dataset.py uses at eval time
+    (z_start = clip(z - pz // 2, 0, max(0, D - pz))), run one forward pass, and
+    take that single output as frame z's prediction directly — there is no
+    local index to extract, the model's one answer IS the centred frame.
+
+    This means D independent forward passes per pullback (no overlap/stride
+    choice the way predict_pullback has, since there's nothing to accumulate —
+    each frame gets its own window and exactly one answer). Each pass is a
+    single cheap 2D conv forward (no point-sampling decode loop), so this is
+    not necessarily slower in wall-clock terms than the INR path despite the
+    larger pass count.
+    """
+    model.eval()
+    D, H, W = volume.shape
+    pz = cfg.patch_z
+
+    predictions = np.zeros((D, H, W), dtype=np.int64)
+    for z in range(D):
+        z_start = int(np.clip(z - pz // 2, 0, max(0, D - pz)))
+        z_end   = min(z_start + pz, D)
+        actual_len = z_end - z_start
+
+        patch = volume[z_start:z_end].copy()
+        if actual_len < pz:
+            pad   = np.broadcast_to(patch[-1:], (pz - actual_len, H, W))
+            patch = np.concatenate([patch, pad], axis=0)
+
+        vol_t  = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float().to(device)
+        logits = model(vol_t)   # [1, C, H, W]
+        predictions[z] = logits.argmax(dim=1).squeeze(0).cpu().numpy()
+
+    return predictions
+
+
+@torch.no_grad()
+def predict_pullback_unet3d(
+    model:        ResidualUNet3D,
+    volume:       np.ndarray,        # [D, H, W] float32, z-score normalised
+    cfg:          Config,
+    device:       torch.device,
+    overlap_frac: float = 0.0,       # fraction of patch_z that overlaps between patches — same
+                                      # convention as predict_pullback (ConditionalINR)
+) -> np.ndarray:                     # [D, H, W] int64 class predictions
+    """Dense segmentation of a full pullback via sliding z-patches.
+
+    Unlike ResidualUNet2p5D (one frame at a time, no overlap concept —
+    see predict_pullback_unet above), ResidualUNet3D predicts a full
+    [C, patch_z, H, W] volume per forward pass, so overlapping patches can be
+    accumulated exactly like predict_pullback (ConditionalINR) does for its
+    coordinate-sampled logits: sum overlapping logits, argmax at the end
+    (equivalent to averaging for argmax purposes).
+
+    overlap_frac controls the stride between consecutive patches:
+        0.0  → non-overlapping (stride = pz, cheapest)
+        0.5  → 50 % overlap    (stride = pz // 2)
+        1.0  → maximum overlap (stride = 1, one step per frame)
+    """
+    model.eval()
+    D, H, W = volume.shape
+    pz = cfg.patch_z
+    C  = cfg.num_classes
+    stride = max(1, round(pz * (1.0 - overlap_frac)))
+
+    logit_sum = np.zeros((D, H, W, C), dtype=np.float32)
+
+    z_start = 0
+    while z_start < D:
+        z_end      = min(z_start + pz, D)
+        actual_len = z_end - z_start
+
+        patch = volume[z_start:z_end].copy()
+        if actual_len < pz:
+            pad   = np.broadcast_to(patch[-1:], (pz - actual_len, H, W))
+            patch = np.concatenate([patch, pad], axis=0)
+
+        vol_t  = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float().to(device)
+        logits = model(vol_t)   # [1, C, pz, H, W]
+        logits = logits.squeeze(0).permute(1, 2, 3, 0).cpu().numpy()   # [pz, H, W, C]
+
+        logit_sum[z_start:z_end] += logits[:actual_len]
         z_start += stride
 
     return logit_sum.argmax(axis=-1).astype(np.int64)

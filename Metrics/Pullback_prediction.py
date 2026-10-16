@@ -305,6 +305,12 @@ def main():
     parser.add_argument("--postprocess_config", type=str, default=_DEFAULT_POSTPROCESS_CONFIG)
     parser.add_argument("--postprocess_n_procs", type=int, default=4)
     parser.add_argument("--max_pullbacks", type=int, default=None, help="Only process the first N test pullbacks (debugging)")
+    parser.add_argument("--skip_existing_predictions", action="store_true",
+                         help="If this pullback's prediction .nii.gz already exists in the output's predictions/ "
+                              "folder (the postprocessed one if --postprocess is set, else the raw one), reuse it "
+                              "instead of re-running inference -- lets a restart (e.g. after a crash, or to extend "
+                              "metrics/HTML-report options) skip pullbacks already done rather than recomputing "
+                              "every prediction from scratch. Off by default: always recompute, same as before.")
     parser.add_argument("--skip_continuous_metrics", action="store_true",
                          help="Skip lipid arc/FCT/calcium arc/depth/thickness (plaque_quantification.py is slow "
                               "per frame when the structure is present -- adds real runtime on a full test set)")
@@ -443,14 +449,22 @@ def main():
         raw_pred_path  = pred_dir / f"{pid}_pred_overlap{args.overlap}.nii.gz"
         postproc_path  = pred_dir / f"{pid}_pred_overlap{args.overlap}_postprocessed.nii.gz"
 
-        predict_conditionalinr(
-            volume, model, cfg, device, str(raw_pred_path),
-            overlap_frac=args.overlap, chunk_size=args.chunk_size, use_amp=args.use_amp,
-            postprocess_classes=postprocess_classes,
-            postprocess_output_path=str(postproc_path) if postprocess_classes is not None else None,
-            postprocess_n_procs=args.postprocess_n_procs,
-            eval_resolution=args.eval_resolution,
-        )
+        # The file this run actually needs to end up with -- postprocessed if --postprocess
+        # is set (predict_conditionalinr writes both raw and postprocessed in one call when
+        # postprocess_classes is given, so raw alone existing isn't sufficient evidence the
+        # postprocessed one was ever produced), otherwise just the raw prediction.
+        needed_path = postproc_path if postprocess_classes is not None else raw_pred_path
+        if args.skip_existing_predictions and needed_path.exists():
+            print(f"[INFO] {pid}: {needed_path.name} already exists -- skipping inference, reusing it")
+        else:
+            predict_conditionalinr(
+                volume, model, cfg, device, str(raw_pred_path),
+                overlap_frac=args.overlap, chunk_size=args.chunk_size, use_amp=args.use_amp,
+                postprocess_classes=postprocess_classes,
+                postprocess_output_path=str(postproc_path) if postprocess_classes is not None else None,
+                postprocess_n_procs=args.postprocess_n_procs,
+                eval_resolution=args.eval_resolution,
+            )
 
         score_path = postproc_path if (args.postprocess and postproc_path.exists()) else raw_pred_path
         pred = sitk.GetArrayFromImage(sitk.ReadImage(str(score_path)))  # [D,H,W]
@@ -588,7 +602,12 @@ def main():
     if args.html_report:
         if html_manifest:
             report_path = html_dir / report_name
-            build_html(html_manifest, class_names, class_colors, report_path)
+            # long_manifest=[] -- this script only renders per-frame overlays, never the
+            # separate longitudinal-angle-sweep view create_html_report.py's own main() builds;
+            # the HTML's own JS handles an empty LONG_MANIFEST gracefully (just disables that
+            # view's toggle). build_html() gained this required param after this call site was
+            # written and was never updated -- --html_report has been broken here ever since.
+            build_html(html_manifest, [], class_names, class_colors, report_path)
             print(f"\n[INFO] Wrote HTML QC report: {report_path} ({len(html_manifest)} frames)")
         else:
             print("\n[WARN] --html_report was set but no frames were rendered -- nothing to write.")

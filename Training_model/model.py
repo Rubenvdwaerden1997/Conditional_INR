@@ -101,7 +101,9 @@ def normalize_coords_for_grid_sample(
     D, H, W = volume_shape
     x = 2.0 * coords[..., 0] / (W - 1) - 1.0
     y = 2.0 * coords[..., 1] / (H - 1) - 1.0
-    z = 2.0 * coords[..., 2] / (D - 1) - 1.0
+    # D == 1 (single-frame 2D input, patch_z=1): (D - 1) would be a divide-by-zero. The feature
+    # volume has exactly one z plane, so every query samples it -- pin z to its centre (0).
+    z = 2.0 * coords[..., 2] / (D - 1) - 1.0 if D > 1 else torch.zeros_like(coords[..., 2])
     return torch.stack([x, y, z], dim=-1)
 
 
@@ -852,7 +854,7 @@ class INR(nn.Module):
     """
 
     def __init__(self, in_dim: int, hidden: int, out_dim: int, depth: int = 4,
-                 activation: str = "relu", omega_0: float = 30.0):
+                 activation: str = "relu", omega_0: float = 30.0, extra_dim: int = 0):
         super().__init__()
         assert depth >= 2, "Need at least 2 layers for the skip connection"
         assert activation in ("relu", "siren"), f"Unknown activation: {activation}"
@@ -860,9 +862,10 @@ class INR(nn.Module):
         mid = depth // 2
         self.activation       = activation
         self.omega_0          = omega_0
+        self.extra_dim        = extra_dim   # features concatenated ONLY at the midpoint (skip) layer
         self.input_layer      = nn.Linear(in_dim, hidden)
         self.layers_pre_skip  = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(mid - 1)])
-        self.skip_layer       = nn.Linear(in_dim + hidden, hidden)
+        self.skip_layer       = nn.Linear(in_dim + extra_dim + hidden, hidden)
         self.layers_post_skip = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(depth - mid - 1)])
         self.output_layer     = nn.Linear(hidden, out_dim)
 
@@ -887,12 +890,16 @@ class INR(nn.Module):
             return torch.sin(self.omega_0 * x)
         return self._relu(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """[..., in_dim]  →  [..., out_dim]"""
+    def forward(self, x: torch.Tensor, extra: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """[..., in_dim] (+ optional [..., extra_dim] fed only to the midpoint layer)  →  [..., out_dim]"""
         h = self._act(self.input_layer(x))
         for layer in self.layers_pre_skip:
             h = self._act(layer(h))
-        h = self._act(self.skip_layer(torch.cat([x, h], dim=-1)))
+        if self.extra_dim > 0:
+            assert extra is not None, "INR built with extra_dim>0 needs `extra` at forward"
+            h = self._act(self.skip_layer(torch.cat([x, extra, h], dim=-1)))
+        else:
+            h = self._act(self.skip_layer(torch.cat([x, h], dim=-1)))
         for layer in self.layers_post_skip:
             h = self._act(layer(h))
         return self.output_layer(h)
@@ -1039,14 +1046,22 @@ class ConditionalINR(nn.Module):
         cond_dim      = (cfg.encoder_feat if cfg.use_local_features else 0) + cfg.global_feat_ch
         if cfg.use_local_features and cfg.feature_sampling == "liif":
             cond_dim += 3   # normalised delta offset (x, y, z) to nearest cell centre
+        ms_dim = 0
+        # Levels actually used: cfg.multiscale_levels clamped to what the depth provides
+        # (1-2 at depth 3, 1-4 at depth 5).
+        self.ms_levels = sorted(l for l in cfg.multiscale_levels
+                                if l <= (4 if cfg.encoder_depth == 5 else 2))
         if self.use_multiscale:
-            # layer1 (feat_ch/2 channels, H/2) + layer2 (feat_ch channels, H/4),
-            # trilinearly sampled at the same query coords as the bottleneck.
-            cond_dim += cfg.encoder_feat // 2 + cfg.encoder_feat
-            if cfg.encoder_depth == 5:
-                # layer3 (H/8) + layer4 (H/16), both at feat_ch channels
-                # (layer3-5 preserve channel count, unlike layer1->layer2).
-                cond_dim += 2 * cfg.encoder_feat
+            assert self.ms_levels, \
+                f"multiscale_levels {cfg.multiscale_levels} leaves nothing at encoder_depth={cfg.encoder_depth}"
+            # layer1 (feat_ch/2 channels, H/2); layer2 (H/4), layer3 (H/8), layer4 (H/16) all feat_ch
+            # (layer3-5 preserve channel count, unlike layer1->layer2), each trilinearly sampled at
+            # the same query coords as the bottleneck.
+            ms_dim = sum(cfg.encoder_feat // 2 if l == 1 else cfg.encoder_feat for l in self.ms_levels)
+        # "mid": the multiscale features skip the first MLP layer and enter only at the midpoint layer.
+        self.ms_at_mid = self.use_multiscale and cfg.multiscale_inject == "mid"
+        if not self.ms_at_mid:
+            cond_dim += ms_dim
 
         if cfg.encoder_type == "2.5d":
             self.encoder = ResNetEncoder2p5D(
@@ -1089,6 +1104,7 @@ class ConditionalINR(nn.Module):
                 depth=cfg.inr_depth,
                 activation="relu",
                 omega_0=cfg.siren_omega_0,
+                extra_dim=ms_dim if self.ms_at_mid else 0,
             )
 
         if cfg.feature_supervision:
@@ -1142,17 +1158,18 @@ class ConditionalINR(nn.Module):
             else:
                 local_feat = sample_features(feat_vol, coords_grid)      # [B, N, feat_ch]
                 cond_parts = [local_feat, g_feat_exp]
+            ms_parts = []
             if self.use_multiscale and layer1 is not None and layer2 is not None:
-                l1_feat = sample_features(layer1, coords_grid)           # [B, N, feat_ch/2]
-                l2_feat = sample_features(layer2, coords_grid)           # [B, N, feat_ch]
-                cond_parts.extend([l1_feat, l2_feat])
-                if layer3 is not None and layer4 is not None:
-                    l3_feat = sample_features(layer3, coords_grid)       # [B, N, feat_ch]
-                    l4_feat = sample_features(layer4, coords_grid)       # [B, N, feat_ch]
-                    cond_parts.extend([l3_feat, l4_feat])
+                levels = {1: layer1, 2: layer2, 3: layer3, 4: layer4}    # 1: feat/2 ch, 2-4: feat ch
+                for lvl in self.ms_levels:
+                    ms_parts.append(sample_features(levels[lvl], coords_grid))   # [B, N, C_lvl]
+            ms_feat = torch.cat(ms_parts, dim=-1) if (self.ms_at_mid and ms_parts) else None
+            if not self.ms_at_mid:
+                cond_parts.extend(ms_parts)
             cond = torch.cat(cond_parts, dim=-1)                         # [B, N, cond_dim]
         else:
             local_feat = None
+            ms_feat    = None
             cond       = g_feat_exp                                    # [B, N, global_ch]
         coords_norm = normalize_coords_3d(coords, volume_shape, self.cfg)
 
@@ -1160,7 +1177,7 @@ class ConditionalINR(nn.Module):
             logits = self.inr(coords_norm, cond)                       # FiLM: coords + cond separate
         else:
             pe     = self.pe(coords_norm)                              # [B, N, pe_dim]
-            logits = self.inr(torch.cat([pe, cond], dim=-1))          # ReLU: all concatenated
+            logits = self.inr(torch.cat([pe, cond], dim=-1), extra=ms_feat)   # ReLU: all concatenated (ms_feat only at mid layer)
 
         if return_feat_logits:
             assert local_feat is not None, "return_feat_logits requires use_local_features=True"
@@ -1242,3 +1259,50 @@ class ResidualUNet2p5D(nn.Module):
         feat, _ = self.encoder(volume)     # feat: [B, feat_ch, 1, H/8 (or H/32, H/128), W/...]
         feat2d = feat.squeeze(2)           # drop the D'=1 axis
         return self.dense_decoder(feat2d)
+
+
+# ---------------------------------------------------------------------------
+# 3D Residual U-Net baseline (dense prediction, no INR/coordinate decoding)
+# ---------------------------------------------------------------------------
+
+class ResidualUNet3D(nn.Module):
+    """3D encoder (ResNetEncoder3D) + dense 3D decoder (DenseDecoder3D), no INR.
+
+    Predicts a full [num_classes, D, H, W] volume in one forward pass — the
+    direct 3D counterpart to ResidualUNet2p5D (which predicts only the central
+    2D frame). Requires encoder_depth=5 WITH skip connections (asserted
+    below): DenseDecoder3D's no-skip path only upsamples XY, never Z, so
+    without skip connections the output D would be coarser than the input
+    patch — skip connections are what restores full D resolution (see
+    DenseDecoder3D's docstring).
+
+    Baseline to compare against a ConditionalINR run with encoder_type="3d":
+    same ResNetEncoder3D construction (same cfg fields: encoder_feat,
+    global_feat_ch, dilation_xy, encoder_z_strides, encoder_depth), only the
+    decoder differs (this dense conv decoder vs the INR's coordinate-sampled
+    MLP) — mirrors ResidualUNet2p5D's own role as a decoder-only-difference
+    comparison against the 2.5D INR.
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        assert cfg.encoder_depth == 5, "ResidualUNet3D requires encoder_depth=5"
+        assert cfg.dense_decoder_skip_connections, \
+            "ResidualUNet3D requires dense_decoder_skip_connections=True (no-skip depth=5 not implemented)"
+        self.cfg = cfg
+        self.encoder = ResNetEncoder3D(
+            in_ch=1, feat_ch=cfg.encoder_feat,
+            global_ch=cfg.global_feat_ch,
+            dilation_xy=cfg.dilation_xy,
+            z_strides=cfg.encoder_z_strides,
+            depth=cfg.encoder_depth,
+        )
+        self.dense_decoder = DenseDecoder3D(
+            cfg.encoder_feat, cfg.num_classes,
+            use_skip_connections=True, encoder_depth=5,
+        )
+
+    def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        """[B, 1, D, H, W]  ->  [B, num_classes, D, H, W]"""
+        feat_vol, _, l1, l2, l3, l4 = self.encoder.forward_deep_multiscale(volume)
+        return self.dense_decoder(feat_vol, layer1=l1, layer2=l2, layer3=l3, layer4=l4)

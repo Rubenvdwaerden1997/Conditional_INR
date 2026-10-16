@@ -173,6 +173,18 @@ class Config:
     # encoder_depth=7 not supported (no forward_deep_multiscale equivalent).
     use_intermediate_features: bool = False
 
+    # Where the multiscale features above enter the ReLU MLP.
+    #   "input": concatenated with the PE + bottleneck features at the MLP's first layer (original).
+    #   "mid":   NOT given to the first layer; concatenated only at the MLP's midpoint (NeRF-style
+    #            skip) layer, next to the re-injected input and the hidden activations. ReLU MLP only
+    #            (the SIREN/FiLM path conditions every layer on cond already).
+    multiscale_inject: str = "input"
+
+    # Which encoder levels use_intermediate_features samples (1 = finest, H/2). Default: all
+    # available (1-2 at depth 3, 1-4 at depth 5), i.e. the original behaviour. E.g. [1] = only the
+    # finest level. Channels per level: 1 -> feat/2, 2/3/4 -> feat.
+    multiscale_levels: List[int] = field(default_factory=lambda: [1, 2, 3, 4])
+
     # Spatial TV regularisation weight applied to the dense feature-head output.
     # Penalises isolated wrong-class predictions (e.g. background inside lumen).
     # Only active when feature_supervision=True (dense head must be enabled).
@@ -195,6 +207,12 @@ class Config:
     # Encoder sees this many frames; only the annotated frame within the patch
     # contributes to the supervised loss.  Patch is centered on the annotated frame.
     patch_z: int = 32
+
+    # Zarr-backed loader only. True: the annotated frame is ALWAYS at window index patch_z // 2
+    # (train and val), windows that run past the pullback ends are edge-padded instead of
+    # shifted, and ONLY that frame carries labels. Use an odd patch_z (e.g. 15) so the centre
+    # is a real frame. False: legacy behaviour (random placement in train, clipped centring in val).
+    z_fixed_center: bool = False
 
     # Coordinate sampling strategy during training.
     # "random"             — uniform random draw from labeled pixels (70 %) + random (30 %)
@@ -321,6 +339,13 @@ class Config:
         assert not (self.use_intermediate_features and self.encoder_depth not in (3, 5)), \
             "use_intermediate_features (INR multiscale conditioning) is only implemented for " \
             "encoder_depth=3 or 5 so far (no forward_deep_multiscale equivalent for depth=7)."
+        assert len(self.multiscale_levels) > 0 and all(l in (1, 2, 3, 4) for l in self.multiscale_levels) \
+            and len(set(self.multiscale_levels)) == len(self.multiscale_levels), \
+            f"multiscale_levels must be distinct values from 1-4, got {self.multiscale_levels}"
+        assert self.multiscale_inject in ("input", "mid"), \
+            f"multiscale_inject must be 'input' or 'mid', got '{self.multiscale_inject}'"
+        assert not (self.multiscale_inject == "mid" and self.inr_activation == "siren"), \
+            "multiscale_inject='mid' is only implemented for the ReLU MLP (inr_activation='relu')"
         assert self.encoder_type in ("3d", "2.5d"), \
             f"encoder_type must be '3d' or '2.5d', got '{self.encoder_type}'"
         assert not (self.encoder_type == "2.5d" and (self.use_dense_decoder or self.use_intermediate_features)), \

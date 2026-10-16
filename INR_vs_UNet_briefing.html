@@ -1,0 +1,577 @@
+<title>INR vs U-Net Scaling</title>
+<meta name="description" content="Research briefing on &quot;How Far Can INRs Go?&quot; (Shang et al.) for discussion with a supervisor">
+<style>
+  :root {
+    --bg: #F5F6F3;
+    --bg-alt: #EBEEE8;
+    --ink: #1A2119;
+    --ink-soft: #52605A;
+    --ink-faint: #8A968F;
+    --border: #D7DED3;
+    --accent-inr: #2E7D6B;
+    --accent-inr-soft: #DCEEE7;
+    --accent-unet: #B5551B;
+    --accent-unet-soft: #F4E3D4;
+    --card-bg: #FFFFFF;
+    --shadow: 0 1px 2px rgba(20,30,20,0.04), 0 2px 10px rgba(20,30,20,0.04);
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #13170F;
+      --bg-alt: #1B2117;
+      --ink: #ECEFE8;
+      --ink-soft: #AEBAAC;
+      --ink-faint: #71806E;
+      --border: #2B3327;
+      --accent-inr: #52C7A8;
+      --accent-inr-soft: #1D3831;
+      --accent-unet: #E4914F;
+      --accent-unet-soft: #3A2A1B;
+      --card-bg: #1A2016;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #13170F;
+    --bg-alt: #1B2117;
+    --ink: #ECEFE8;
+    --ink-soft: #AEBAAC;
+    --ink-faint: #71806E;
+    --border: #2B3327;
+    --accent-inr: #52C7A8;
+    --accent-inr-soft: #1D3831;
+    --accent-unet: #E4914F;
+    --accent-unet-soft: #3A2A1B;
+    --card-bg: #1A2016;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'IBM Plex Sans', Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    padding-left: 16px;
+    padding-right: 16px;
+    padding-block: 0;
+  }
+  .wrap { max-width: 740px; margin: 0 auto; padding-top: 48px; padding-bottom: 80px; }
+
+  .kicker {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent-inr);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-weight: 600;
+    font-size: 40px;
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+    margin: 0 0 10px;
+    text-wrap: balance;
+    color: var(--ink);
+  }
+  .authors { color: var(--ink-soft); font-size: 15px; margin: 0 0 4px; }
+  .arxiv-link { font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--ink-faint); text-decoration: none; border-bottom: 1px dotted var(--ink-faint); }
+  .arxiv-link:hover { color: var(--accent-inr); border-color: var(--accent-inr); }
+
+  .subtitle {
+    font-size: 18px;
+    color: var(--ink-soft);
+    margin: 24px 0 0;
+    max-width: 62ch;
+  }
+
+  nav.toc {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 36px 0 0;
+    padding: 20px 0 0;
+    border-top: 1px solid var(--border);
+  }
+  nav.toc a {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    text-decoration: none;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 100px;
+    padding: 6px 12px;
+    white-space: nowrap;
+  }
+  nav.toc a:hover { border-color: var(--accent-inr); color: var(--accent-inr); }
+
+  section { margin-top: 56px; }
+  section:first-of-type { margin-top: 48px; }
+
+  .num {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    color: var(--accent-inr);
+    display: block;
+    margin-bottom: 6px;
+    letter-spacing: 0.04em;
+  }
+  h2 {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-weight: 600;
+    font-size: 26px;
+    margin: 0 0 18px;
+    color: var(--ink);
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: 'IBM Plex Sans', Arial, sans-serif;
+    font-weight: 600;
+    font-size: 16px;
+    margin: 28px 0 10px;
+    color: var(--ink);
+  }
+  p { margin: 0 0 14px; max-width: 68ch; color: var(--ink); }
+  p.soft { color: var(--ink-soft); }
+  ul, ol { margin: 0 0 14px; padding-left: 22px; max-width: 64ch; }
+  li { margin-bottom: 8px; }
+  strong { color: var(--ink); }
+
+  .quote {
+    font-family: 'Source Serif 4', Georgia, serif;
+    font-style: italic;
+    font-size: 17px;
+    line-height: 1.55;
+    color: var(--ink);
+    border-left: 3px solid var(--accent-inr);
+    padding: 2px 0 2px 18px;
+    margin: 18px 0;
+    max-width: 60ch;
+  }
+
+  .callout {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent-inr);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin: 20px 0;
+    box-shadow: var(--shadow);
+  }
+  .callout.unet { border-left-color: var(--accent-unet); }
+  .callout-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--accent-inr);
+    margin: 0 0 8px;
+    display: block;
+  }
+  .callout.unet .callout-label { color: var(--accent-unet); }
+  .callout p:last-child { margin-bottom: 0; }
+
+  .verdict-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin: 20px 0;
+  }
+  @media (max-width: 560px) { .verdict-grid { grid-template-columns: 1fr; } }
+  .verdict-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 18px 16px;
+    box-shadow: var(--shadow);
+  }
+  .verdict-card.inr { border-top: 3px solid var(--accent-inr); }
+  .verdict-card.unet { border-top: 3px solid var(--accent-unet); }
+  .verdict-title {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    margin: 0 0 10px;
+  }
+  .verdict-card.inr .verdict-title { color: var(--accent-inr); }
+  .verdict-card.unet .verdict-title { color: var(--accent-unet); }
+  .verdict-card ul { margin: 0; padding-left: 18px; }
+  .verdict-card li { font-size: 14.5px; margin-bottom: 6px; color: var(--ink-soft); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  .table-wrap { overflow-x: auto; margin: 16px 0; }
+  th, td {
+    text-align: left;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+    font-weight: 500;
+  }
+  td.num-cell, th.num-cell { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; text-align: right; }
+  tr:last-child td { border-bottom: none; }
+
+  .chart-box {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 20px 14px;
+    margin: 20px 0;
+    box-shadow: var(--shadow);
+  }
+  .chart-title { font-size: 13.5px; font-weight: 600; margin: 0 0 2px; color: var(--ink); }
+  .chart-caption { font-size: 12.5px; color: var(--ink-faint); margin: 10px 0 0; }
+  svg.chart { width: 100%; height: auto; display: block; margin-top: 10px; }
+  .legend { display: flex; gap: 18px; margin-top: 10px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-soft); }
+  .legend-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+  .model-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin: 18px 0;
+  }
+  @media (max-width: 560px) { .model-grid { grid-template-columns: 1fr; } }
+  .model-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    box-shadow: var(--shadow);
+  }
+  .model-name { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; margin: 0 0 6px; color: var(--ink); }
+  .model-desc { font-size: 13.5px; color: var(--ink-soft); margin: 0; }
+  .tag {
+    display: inline-block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 100px;
+    margin-bottom: 8px;
+  }
+  .tag.inr { background: var(--accent-inr-soft); color: var(--accent-inr); }
+  .tag.unet { background: var(--accent-unet-soft); color: var(--accent-unet); }
+
+  hr.rule { border: none; border-top: 1px solid var(--border); margin: 48px 0 0; }
+
+  footer {
+    margin-top: 56px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--ink-faint);
+  }
+</style>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<div class="wrap">
+
+  <p class="kicker">Research briefing — paper walkthrough</p>
+  <h1>How Far Can INRs Go?</h1>
+  <p class="authors">Cross-Domain Parameter-Efficient INR-Based Semantic Segmentation for Brain MRI</p>
+  <p class="authors">Shang, Sadeghi, Jiang, Wong, Rambhatla — University of Waterloo &nbsp;·&nbsp;
+    <a class="arxiv-link" href="https://arxiv.org/html/2609.31573v1" target="_blank" rel="noopener">arXiv:2609.31573v1</a>
+  </p>
+  <p class="subtitle">When should an implicit neural representation actually beat a U-Net? The paper answers this by sweeping both model families across the same parameter budgets, with and without augmentation, in- and out-of-domain — rather than arguing for one architecture in the abstract.</p>
+
+  <nav class="toc">
+    <a href="#question">Question</a>
+    <a href="#models">Models</a>
+    <a href="#data">Data &amp; task</a>
+    <a href="#method">Method</a>
+    <a href="#results">Results</a>
+    <a href="#surprises">Surprises</a>
+    <a href="#takeaways">Takeaways</a>
+    <a href="#limits">Limitations</a>
+    <a href="#relevance">Relevance to us</a>
+  </nav>
+
+  <section id="question">
+    <span class="num">01 — Core question</span>
+    <h2>When is an INR worth it, and when isn't it?</h2>
+    <p>Most INR-for-segmentation papers argue their architecture is good. This one instead asks a sharper question: <strong>under what conditions</strong> — parameter budget, domain shift, augmentation — does an INR actually beat a conventional CNN, and when does that advantage reverse? The answer turns out to depend heavily on all three.</p>
+  </section>
+
+  <section id="models">
+    <span class="num">02 — Models compared</span>
+    <h2>Two INR variants, three CNN baselines</h2>
+    <div class="model-grid">
+      <div class="model-card">
+        <span class="tag inr">INR</span>
+        <p class="model-name">MetaSeg</p>
+        <p class="model-desc">Prior work. A SIREN INR meta-trained (MAML-style) across many images, then fine-tuned per-image at test time. Only the <em>last</em> hidden layer's features feed the segmentation head.</p>
+      </div>
+      <div class="model-card">
+        <span class="tag inr">INR</span>
+        <p class="model-name">HierINRSeg</p>
+        <p class="model-desc">This paper's proposal. Same backbone as MetaSeg, but the segmentation head fuses features from <em>all five</em> hidden SIREN layers instead of just the last one.</p>
+      </div>
+      <div class="model-card">
+        <span class="tag unet">CNN</span>
+        <p class="model-name">U-Net</p>
+        <p class="model-desc">Standard 5-level 2D U-Net. Channel width scaled to hit each target parameter budget — the main point of comparison.</p>
+      </div>
+      <div class="model-card">
+        <span class="tag unet">CNN</span>
+        <p class="model-name">nnU-Net-v2 / TransUNet / UNeXt</p>
+        <p class="model-desc">Self-configuring, transformer-based, and parameter-efficient baselines — mostly shown as large-scale or practical reference points, not swept across every budget.</p>
+      </div>
+    </div>
+    <div class="callout">
+      <span class="callout-label">Architecturally important</span>
+      <p><strong>Neither MetaSeg nor HierINRSeg has an image encoder at all.</strong> There's no CNN, no feature extractor, no conditioning network. Image content instead enters through <strong>test-time weight-fitting</strong>: a meta-learned initialization is fine-tuned directly on each new image before segmentation. The entire 5K–1M parameter budget is the SIREN MLP itself — there's no separate "encoder cost" to account for, because there's no encoder.</p>
+    </div>
+  </section>
+
+  <section id="data">
+    <span class="num">03 — Data &amp; task</span>
+    <h2>Brain MRI, three sites, six classes</h2>
+    <p>ABIDE I brain MRI, 2D slices at 160×160, six-class segmentation (background + white matter, cortical gray matter, CSF/ventricles, subcortical gray matter, cerebellum).</p>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Site</th><th>Slices</th><th>Role</th></tr>
+        <tr><td>KKI</td><td class="num-cell">491</td><td>In-domain (70/15/15 train/val/test, by subject)</td></tr>
+        <tr><td>Caltech</td><td class="num-cell">386</td><td>Out-of-domain test only</td></tr>
+        <tr><td>CMU</td><td class="num-cell">283</td><td>Out-of-domain test only</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <section id="method">
+    <span class="num">04 — Method</span>
+    <h2>Two protocols, eleven budgets each</h2>
+    <p>Every model is swept across <strong>11 parameter budgets from 5K to 1M</strong>, under two separate protocols:</p>
+    <ul>
+      <li><strong>Controlled scaling</strong> — no augmentation at all. Isolates pure architecture-vs-budget behavior.</li>
+      <li><strong>Practical scaling</strong> — adds standard intensity augmentation (gamma, contrast, intensity, Gaussian noise), both cross-entropy and focal loss for U-Net, plus a UNeXt sweep and nnU-Net/TransUNet as large-model reference points.</li>
+    </ul>
+    <p>Two further probes: sensitivity to how much of the 3D volume's slice range is sampled (5–80% coverage), and whether augmentation effects survive the INR's test-time fitting step at all.</p>
+    <p class="soft">Metric throughout: mean Dice over foreground classes, averaged over subjects, reported as mean ± std across 3 seeds.</p>
+  </section>
+
+  <section id="results">
+    <span class="num">05 — Results</span>
+    <h2>Where each model actually wins</h2>
+
+    <div class="chart-box">
+      <p class="chart-title">Parameter budget vs. which model wins (in-domain, no augmentation)</p>
+      <svg class="chart" viewBox="0 0 640 170" role="img" aria-label="Schematic diagram showing INR models favored below roughly 50K parameters and U-Net favored above roughly 200K parameters, on a log scale from 5K to 1M">
+        <defs>
+          <linearGradient id="fadeInr" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="var(--accent-inr)" stop-opacity="0.35"/>
+            <stop offset="100%" stop-color="var(--accent-inr)" stop-opacity="0.05"/>
+          </linearGradient>
+          <linearGradient id="fadeUnet" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="var(--accent-unet)" stop-opacity="0.05"/>
+            <stop offset="100%" stop-color="var(--accent-unet)" stop-opacity="0.35"/>
+          </linearGradient>
+        </defs>
+        <!-- axis line -->
+        <line x1="40" y1="90" x2="600" y2="90" stroke="var(--border)" stroke-width="1.5"/>
+        <!-- INR zone -->
+        <rect x="40" y="70" width="210" height="40" fill="url(#fadeInr)"/>
+        <!-- mixed zone -->
+        <rect x="250" y="70" width="140" height="40" fill="var(--ink-faint)" opacity="0.08"/>
+        <!-- U-Net zone -->
+        <rect x="390" y="70" width="210" height="40" fill="url(#fadeUnet)"/>
+        <!-- tick marks + labels (log scale 5K..1M) -->
+        <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--ink-faint)">
+          <line x1="40" y1="90" x2="40" y2="98" stroke="var(--ink-faint)"/>
+          <text x="40" y="114" text-anchor="middle">5K</text>
+          <line x1="250" y1="90" x2="250" y2="98" stroke="var(--ink-faint)"/>
+          <text x="250" y="114" text-anchor="middle">~50K</text>
+          <line x1="390" y1="90" x2="390" y2="98" stroke="var(--ink-faint)"/>
+          <text x="390" y="114" text-anchor="middle">~200K</text>
+          <line x1="600" y1="90" x2="600" y2="98" stroke="var(--ink-faint)"/>
+          <text x="600" y="114" text-anchor="middle">1M</text>
+        </g>
+        <!-- zone labels -->
+        <text x="145" y="60" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="var(--accent-inr)">INR favored</text>
+        <text x="320" y="60" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="var(--ink-faint)">mixed</text>
+        <text x="495" y="60" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13" font-weight="600" fill="var(--accent-unet)">U-Net favored</text>
+        <text x="145" y="138" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="var(--ink-faint)">HierINRSeg leads</text>
+        <text x="495" y="138" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11" fill="var(--ink-faint)">U-Net overtakes</text>
+      </svg>
+      <p class="chart-caption">Schematic, log-scale budget axis — crossover points are approximate (from Fig. 5), not exact thresholds. Out-of-domain, HierINRSeg's lead extends across almost the whole range.</p>
+    </div>
+
+    <h3>HierINRSeg's margin over MetaSeg, by domain</h3>
+    <div class="chart-box">
+      <svg class="chart" viewBox="0 0 640 220" role="img" aria-label="Bar chart: HierINRSeg improves over MetaSeg by 5.6 points in-domain, 7.2 points on Caltech, 9.2 points on CMU">
+        <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--ink-faint)">
+          <line x1="50" y1="170" x2="610" y2="170" stroke="var(--border)"/>
+          <text x="45" y="174" text-anchor="end">0</text>
+          <line x1="50" y1="30" x2="610" y2="30" stroke="var(--border)" stroke-dasharray="2,3"/>
+          <text x="45" y="34" text-anchor="end">10pp</text>
+        </g>
+        <!-- bars: max 10pp -> 140px tall -->
+        <g>
+          <rect x="110" y="170" width="90" height="0" fill="var(--accent-inr)"/>
+          <rect x="110" y="92" width="90" height="78" fill="var(--accent-inr)" rx="4"/>
+          <text x="155" y="80" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="13" font-weight="600" fill="var(--ink)">+5.6</text>
+          <text x="155" y="192" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="12" fill="var(--ink-soft)">In-domain (KKI)</text>
+        </g>
+        <g>
+          <rect x="285" y="70" width="90" height="100" fill="var(--accent-inr)" rx="4"/>
+          <text x="330" y="58" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="13" font-weight="600" fill="var(--ink)">+7.2</text>
+          <text x="330" y="192" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="12" fill="var(--ink-soft)">OOD (Caltech)</text>
+        </g>
+        <g>
+          <rect x="460" y="40" width="90" height="130" fill="var(--accent-inr)" rx="4"/>
+          <text x="505" y="28" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="13" font-weight="600" fill="var(--ink)">+9.2</text>
+          <text x="505" y="192" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="12" fill="var(--ink-soft)">OOD (CMU)</text>
+        </g>
+      </svg>
+      <p class="chart-caption">Dice percentage points, averaged across the swept budgets. The hierarchical multi-layer fusion helps more the further you are from the training domain.</p>
+    </div>
+
+    <h3>Why HierINRSeg wins: multi-layer fusion, not head size</h3>
+    <div class="chart-box">
+      <p class="chart-title">Dice score — head-capacity ablation (fixed 67K-param INR backbone)</p>
+      <svg class="chart" viewBox="0 0 640 210" role="img" aria-label="Bar chart: MetaSeg with 4K-parameter head reaches 0.670 Dice, with 594K-parameter head reaches 0.691, HierINRSeg with 138K total parameters reaches 0.746">
+        <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--ink-faint)">
+          <line x1="50" y1="170" x2="610" y2="170" stroke="var(--border)"/>
+          <text x="45" y="174" text-anchor="end">0.0</text>
+          <line x1="50" y1="20" x2="610" y2="20" stroke="var(--border)" stroke-dasharray="2,3"/>
+          <text x="45" y="24" text-anchor="end">1.0</text>
+        </g>
+        <g>
+          <rect x="90" y="69.5" width="110" height="100.5" fill="var(--accent-unet)" opacity="0.75" rx="4"/>
+          <text x="145" y="58" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="13" font-weight="600" fill="var(--ink)">0.670</text>
+          <text x="145" y="192" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11.5" fill="var(--ink-soft)">MetaSeg, 4K head</text>
+        </g>
+        <g>
+          <rect x="265" y="66.35" width="110" height="103.65" fill="var(--accent-unet)" opacity="0.75" rx="4"/>
+          <text x="320" y="55" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="13" font-weight="600" fill="var(--ink)">0.691</text>
+          <text x="320" y="192" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11.5" fill="var(--ink-soft)">MetaSeg, 594K head</text>
+        </g>
+        <g>
+          <rect x="440" y="58.1" width="110" height="111.9" fill="var(--accent-inr)" rx="4"/>
+          <text x="495" y="47" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="13" font-weight="600" fill="var(--ink)">0.746</text>
+          <text x="495" y="192" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="11.5" fill="var(--ink-soft)">HierINRSeg, 138K total</text>
+        </g>
+      </svg>
+      <p class="chart-caption">A 150× larger MetaSeg head barely moves the needle (+0.021). HierINRSeg beats both while using fewer total parameters than the big-head MetaSeg — the gain is architectural, not a parameter-count effect.</p>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <tr><th>Setting</th><th class="num-cell">Dice</th></tr>
+        <tr><td>HierINRSeg — layer 5 only (= MetaSeg's own scheme)</td><td class="num-cell">0.700</td></tr>
+        <tr><td>HierINRSeg — excluding middle layers</td><td class="num-cell">0.730</td></tr>
+        <tr><td>HierINRSeg — all five layers fused</td><td class="num-cell">0.746</td></tr>
+      </table>
+    </div>
+    <p class="soft">Middle layers alone recover most of the gap to full fusion — they carry real, useful anatomical structure, not redundant information.</p>
+
+    <h3>Spatial coverage (10K-parameter budget, 5% of slice range)</h3>
+    <div class="chart-box">
+      <svg class="chart" viewBox="0 0 640 190" role="img" aria-label="Bar chart: at 5 percent spatial coverage, HierINRSeg reaches 0.703 Dice versus U-Net's 0.466">
+        <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--ink-faint)">
+          <line x1="50" y1="150" x2="610" y2="150" stroke="var(--border)"/>
+          <text x="45" y="154" text-anchor="end">0.0</text>
+          <line x1="50" y1="20" x2="610" y2="20" stroke="var(--border)" stroke-dasharray="2,3"/>
+          <text x="45" y="24" text-anchor="end">1.0</text>
+        </g>
+        <g>
+          <rect x="160" y="58.6" width="130" height="91.4" fill="var(--accent-inr)" rx="4"/>
+          <text x="225" y="47" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="14" font-weight="600" fill="var(--ink)">0.703</text>
+          <text x="225" y="172" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="12.5" fill="var(--ink-soft)">HierINRSeg</text>
+        </g>
+        <g>
+          <rect x="390" y="89.4" width="130" height="60.6" fill="var(--accent-unet)" opacity="0.75" rx="4"/>
+          <text x="455" y="78" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="14" font-weight="600" fill="var(--ink)">0.466</text>
+          <text x="455" y="172" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="12.5" fill="var(--ink-soft)">U-Net</text>
+        </g>
+      </svg>
+      <p class="chart-caption">At narrow spatial coverage, HierINRSeg's advantage is large. It shrinks as coverage widens (U-Net holds steady or improves; INR degrades) — exact intermediate values for 20–80% aren't given in the paper.</p>
+    </div>
+  </section>
+
+  <section id="surprises">
+    <span class="num">06 — Surprising findings</span>
+    <h2>Four results that cut against intuition</h2>
+    <ol>
+      <li><strong>Parameters don't keep helping INRs.</strong> They plateau early; U-Net keeps climbing with capacity all the way to 1M.</li>
+      <li><strong>Augmentation barely helps INRs</strong> but substantially helps U-Net — which is exactly why the domain-shift advantage flips at larger budgets.</li>
+      <li><strong>Augmentation gets absorbed during test-time fitting.</strong> Even though the INR never trained with augmentation, the per-image fitting step rapidly suppresses augmentation-induced feature changes relative to natural cross-image variation.</li>
+      <li><strong>INRs are more sensitive to 3D spatial variability</strong> than U-Net, which the authors did not anticipate going in.</li>
+    </ol>
+  </section>
+
+  <section id="takeaways">
+    <span class="num">07 — Takeaways</span>
+    <h2>Pick-the-architecture checklist</h2>
+    <div class="verdict-grid">
+      <div class="verdict-card inr">
+        <p class="verdict-title">CHOOSE AN INR WHEN</p>
+        <ul>
+          <li>Parameter budget is severely constrained (&lt; 50K)</li>
+          <li>Augmentation isn't available or helpful for your data</li>
+          <li>Out-of-domain robustness matters more than peak in-domain accuracy</li>
+        </ul>
+      </div>
+      <div class="verdict-card unet">
+        <p class="verdict-title">CHOOSE A U-NET WHEN</p>
+        <ul>
+          <li>Budget is ≥ 200K parameters</li>
+          <li>Standard augmentation strategies apply to your data</li>
+          <li>You expect substantial 3D spatial variability</li>
+        </ul>
+      </div>
+    </div>
+    <div class="quote">"Segmentation-relevant information is distributed across the hierarchy: early and middle layers retain stable, transferable spatial-anatomical structure, whereas later layers become more label-discriminative and image-specific."</div>
+    <p class="soft">This is the mechanistic reason HierINRSeg's full-layer fusion beats MetaSeg's last-layer-only scheme — and the authors suggest INR-specific augmentation, applied during test-time fitting rather than training, as the natural next step.</p>
+  </section>
+
+  <section id="limits">
+    <span class="num">08 — Stated limitations</span>
+    <h2>What the authors flag themselves</h2>
+    <ul>
+      <li>Only intensity-based augmentation tested — spatial transforms untouched.</li>
+      <li>INR degradation under wider spatial coverage is established but not explained; behavior on more diverse datasets is unknown.</li>
+      <li>Single in-domain site, two OOD sites, all from one dataset family (ABIDE I) — broader validation still needed.</li>
+      <li>No systematic comparison of INR-tailored vs. U-Net-tailored augmentation strategies.</li>
+    </ul>
+  </section>
+
+  <section id="relevance">
+    <span class="num">09 — Relevance to our own comparison</span>
+    <h2>Where this maps onto our work, and where it doesn't</h2>
+    <div class="callout unet">
+      <span class="callout-label">Not a direct match</span>
+      <p>MetaSeg/HierINRSeg have <strong>no encoder</strong> — image content enters through per-image test-time weight-fitting, not feed-forward conditioning. Our <code>ConditionalINR</code> is the opposite: one CNN encoder, one forward pass, no per-image optimization loop. Their whole parameter budget is the coordinate-MLP; ours is split between an encoder and a (fixed-width) decoder MLP.</p>
+    </div>
+    <div class="callout">
+      <span class="callout-label">What does transfer</span>
+      <p>Their core methodology — sweep both architectures across matched parameter budgets rather than comparing one matched point — is exactly the shape of our own <code>encoder_feat</code> sweep, and validates doing it that way. Their U-Net channel-scaling (vary channels per resolution level) is the closer analogue to our <code>encoder_feat</code>; their INR width-scaling (fixed-depth SIREN, varying hidden width) is the closer analogue to our <code>inr_hidden</code> — which we've so far held <em>fixed</em> while sweeping the encoder instead. A literal replication of their INR-side methodology on our pipeline would mean fixing <code>encoder_feat</code> and sweeping <code>inr_hidden</code> instead.</p>
+    </div>
+  </section>
+
+  <footer>
+    Prepared from arXiv:2609.31573v1, "How Far Can INRs Go? Cross-Domain Parameter-efficient INR-Based Semantic Segmentation for Brain MRI." All Dice scores and deltas on this page are quoted directly from the paper's text and tables; the budget-crossover diagram is a schematic reconstruction of Figure 5's qualitative trend, not a digitization of exact data points.
+  </footer>
+
+</div>

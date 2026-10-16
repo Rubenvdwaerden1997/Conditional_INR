@@ -66,6 +66,7 @@ def build_config_from_yaml(yml: dict) -> Config:
         dilation_xy               = seg.get("dilation_xy", 1),
         encoder_z_strides         = seg.get("encoder_z_strides", [1, 1, 1]),
         feature_sampling          = seg.get("feature_sampling", "trilinear"),
+        encoder_type              = seg.get("encoder_type", "3d"),
     )
 
 

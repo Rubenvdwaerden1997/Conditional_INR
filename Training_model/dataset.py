@@ -441,7 +441,12 @@ class OCTPullbackDataset(Dataset):
             z_ann    = entry["z_ann"]
             z_center = z_ann if 0 <= z_ann < n_frames else ann[len(ann) // 2]
             pz       = self.cfg.patch_z
-            if self.mode == "train":
+            if self.cfg.z_fixed_center:
+                # Annotated frame always at local index pz // 2; out-of-range frames are
+                # edge-padded below rather than shifting the window (shifting would move the
+                # annotated frame off-centre near the pullback ends).
+                z_start = z_center - pz // 2
+            elif self.mode == "train":
                 # Random sub-window placement: the annotated frame lands anywhere in
                 # [0, pz-1] within the sampled window -- matches the .npz pipeline's
                 # prebuilt_3d branch above exactly (dataset.py:389-393), just applied to the
@@ -462,16 +467,20 @@ class OCTPullbackDataset(Dataset):
                 z_start = int(np.clip(z_center - pz // 2, 0, max(0, n_frames - pz)))
             z_end = z_start + pz
 
-            image_window = zarr_store_reader.read_image_window(self.zarr_root, pid, z_start, z_end)
+            r0, r1 = max(0, z_start), min(n_frames, z_end)
+            image_window = zarr_store_reader.read_image_window(self.zarr_root, pid, r0, r1)
             mean, std = self.pullback_norm_stats.get(pid, (self.zarr_mean, self.zarr_std))
             patch_vol = (image_window.astype(np.float32) - mean) / (std + 1e-5)
             if patch_vol.shape[0] < pz:
-                pad       = pz - patch_vol.shape[0]
-                patch_vol = np.pad(patch_vol, ((0, pad), (0, 0), (0, 0)), mode="edge")
+                pad_lo    = r0 - z_start   # > 0 only in z_fixed_center mode (z_start < 0)
+                pad_hi    = pz - patch_vol.shape[0] - pad_lo
+                patch_vol = np.pad(patch_vol, ((pad_lo, pad_hi), (0, 0), (0, 0)), mode="edge")
 
             _, H, W      = patch_vol.shape
             patch_labels = np.full((pz, H, W), self.cfg.ignore_index, dtype=np.int64)
-            for z_ann in ann:
+            # Fixed-centre mode supervises only the target frame, so the centre is unambiguous
+            # even when neighbouring frames of a densely labelled pullback fall in the window.
+            for z_ann in ([z_center] if self.cfg.z_fixed_center else ann):
                 if z_start <= z_ann < z_end:
                     raw_label = zarr_store_reader.read_label_frame(self.zarr_root, pid, z_ann)
                     raw_label = raw_label.astype(np.int64)
