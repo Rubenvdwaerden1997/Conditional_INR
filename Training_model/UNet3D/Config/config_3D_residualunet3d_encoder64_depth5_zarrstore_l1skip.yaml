@@ -1,0 +1,98 @@
+# L1-ONLY-SKIP ABLATION of config_3D_residualunet3d_encoder64_depth5_zarrstore_skipconnections.yaml: identical
+# except unet_skip_levels: [1] (and dense_decoder_skip_connections False): only encoder layer1 (H/2) is
+# concatenated into the decoder (at fuse2); layers 2-4 are not. Same decoder path/depth/Z restoration.
+# Direct mirror of the INR + multiscale_levels=[1] (L1 mid) run (0.6686 at enc64).
+# ============================
+# General Settings
+# ============================
+env: "cluster"   #"local" or "cluster"
+training_mode: "3D"   # unused by train_unet3d.py's dataset construction logic path, kept for schema consistency
+save_root: "/data/diag/rubenvdw/Conditional_INR/saved_models_unet3D_conditional"
+experiment_name: "residualunet3d_encoder64_depth5_zarrstore_zjitter_perframe_l1skip"
+
+seed: 42
+device: "cuda"   # or "cpu"
+
+# ============================
+# Data Settings
+# ============================
+# Medium-size tier of the encoder-width sweep (16/32/64/128/256), mirroring
+# UNet2p5D's own sweep and the ConditionalINR encoder_type="3d" depth5 configs in
+# ZARR_format/Config/ -- same ResNetEncoder3D construction (feature_size,
+# global_feat_ch, encoder_z_strides, encoder_depth), only the decoder differs
+# (dense DenseDecoder3D here vs the INR's coordinate-sampled MLP).
+paths:
+  local:
+    data_root: ["W:/rubenvdw/Dataset/3D_Grayscale_Circmask_ForegroundZNorm_Dicoms_Segmentations_12classes_31072026"]
+    split_excel: "W:/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "W:/rubenvdw/Conditional_INR/Patches_preprocessed_3D_foregroundnorm"
+    zarr_store: "W:/rubenvdw/Dataset/Grayscale_Circmask_Unnormalized_OctFmZarrStore_17classes_30092026"
+    zarr_local_cache: ""
+  cluster:
+    data_root: ["/data/diag/rubenvdw/Dataset/3D_Grayscale_Circmask_ForegroundZNorm_Dicoms_Segmentations_12classes_31072026"]
+    split_excel: "/data/diag/rubenvdw/Info_files_Dataset_split/Multiclass_segmentations_stratifiedsplit_28112025_newnamings15012026.xlsx"
+    patches_folder_3d: "/data/diag/rubenvdw/Conditional_INR/Patches_preprocessed_3D_foregroundnorm"
+    zarr_store: "/data/diag/rubenvdw/Dataset/Grayscale_Circmask_Unnormalized_OctFmZarrStore_17classes_30092026"
+    zarr_local_cache: "/mnt/jobcache/oct_fm_store"
+train_batch_size: 2
+
+# ============================
+# Model Settings
+# ============================
+# dense_decoder_skip_connections: True and encoder_depth: 5 are REQUIRED --
+# ResidualUNet3D asserts both (no-skip depth=5 can't restore full D resolution,
+# see DenseDecoder3D's docstring). encoder_z_strides matches the ConditionalINR
+# 3D depth5 configs' own [1,1,2,1,1] exactly, so the encoder is architecturally
+# identical between the two models at this tier.
+model_seg_decoder:
+  out_channels: 12
+  feature_size: 64
+  encoder_depth: 5
+  global_feat_ch: 64
+  dilation_xy: 1
+  encoder_z_strides: [1, 1, 2, 1, 1]
+  encoder_type: "3d"
+  dense_decoder_skip_connections: False
+  unet_skip_levels: [1]   # L1 (H/2) skip only. [] = no skips, None/omitted = all four
+  mapping_activated: True
+  mapping:
+    0: 0 # Background
+    1: 1 # Lumen
+    2: 2 # Guidewire
+    3: 3 # Intima
+    4: 4 # Lipid
+    5: 5 # Calcium
+    6: 6 # Media
+    7: 1 # Catheter
+    8: 7 # Sidebranch
+    9: 8 # Red thrombus
+    10: 8 # White thrombus
+    11: 3 # Dissection
+    12: 9 # Plaque rupture
+    13: 10 # Layered plaque
+    14: 11 # Neovascularization
+    15: 3 # Intraplaque hemorrhage
+    16: 3 # Intramural hematoma
+
+# ============================
+# Training Settings
+# ============================
+training_segmentation:
+  epochs: 300
+  warmup_epochs: 5
+  lr_settings:
+    initial_lr: 0.0003
+    weight_decay: 0.0001
+  val_interval: 5
+  ignore_index: 255
+  ignore_background: True
+  patch_z: 16
+  resize_to: 512
+  n_points: 524288   # unused by the U-Net itself, still read by dataset construction (coords are discarded)
+  use_amp: False
+  grad_clip_norm: 0.0
+  max_batches_frac: 0.25
+  val_interval_pct: 0.05
+  num_workers: 12
+  val_num_workers: 6
+  prefetch_factor: 4

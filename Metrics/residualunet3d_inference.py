@@ -54,6 +54,7 @@ def build_unet3d_config_from_yaml(yml: dict) -> Config:
         encoder_z_strides          = seg.get("encoder_z_strides", [1, 1, 1]),
         encoder_type                = seg.get("encoder_type", "3d"),
         dense_decoder_skip_connections = seg.get("dense_decoder_skip_connections", True),
+        unet_skip_levels           = seg.get("unet_skip_levels", None),
         patch_z                    = tr.get("patch_z", 16),
         resize_to                  = tr.get("resize_to", 0),
         n_points                   = tr.get("n_points", 8192),

@@ -57,6 +57,7 @@ sys.path.insert(1, "/data/diag/rubenvdw/nnunetv2/nnUNet/nnunetv2/Codes/utils")
 from plaque_quantification import quantification_lipid, quantification_calcium
 
 from create_html_report import to_uint8_display, colorize, blend_overlay, save_jpg, get_class_colors, build_html
+from HFER import add_hfer_args, compute_pullback_hfer, build_hfer_tables, load_exclusions
 
 _PIPELINE_DIR_LOCAL   = "W:/rubenvdw/CARA_Pipelines_Segmentationmodels/Pipeline_ConditionalINR"
 _PIPELINE_DIR_CLUSTER = "/data/diag/rubenvdw/CARA_Pipelines_Segmentationmodels/Pipeline_ConditionalINR"
@@ -83,6 +84,7 @@ def main():
     parser.add_argument("--skip_continuous_metrics", action="store_true",
                          help="Skip lipid arc/FCT/calcium arc/depth/thickness (plaque_quantification.py is slow "
                               "per frame when the structure is present -- adds real runtime on a full test set)")
+    add_hfer_args(parser)
     parser.add_argument("--label_file", type=str, default=_DEFAULT_LABEL_FILE)
     parser.add_argument("--html_report", action="store_true")
     parser.add_argument("--html_alpha", type=float, default=0.45)
@@ -147,6 +149,9 @@ def main():
 
     frame_rows: List[dict] = []
     continuous_rows: List[dict] = []
+    hfer_rows: List[dict] = []
+    pixel_frames: List[pd.DataFrame] = []
+    hfer_exclusions = {} if args.skip_hfer else load_exclusions(args.exclusion_excel)
     n_done = 0
     for pid, ann_frames in pullback_to_frames.items():
         t0 = time.time()
@@ -212,6 +217,15 @@ def main():
             "predict_residualunet2p5d's resize and this script's ground-truth downsampling "
             "have gone out of sync, would silently corrupt every Dice number."
         )
+
+        if not args.skip_hfer:
+            # Whole predicted volume (not just annotated frames); `pred` is the postprocessed file when
+            # --postprocess is set. Pixel counts are saved too so HFER can be recomputed at another cutoff.
+            hfer_row, df_px = compute_pullback_hfer(
+                pred, pid, class_names, args.hfer_threshold_cycles_per_mm, args.hfer_min_ac_power,
+                getattr(cfg, "z_spacing", 0.1), hfer_exclusions, args.hfer_min_stretch_frames)
+            hfer_rows.append(hfer_row)
+            pixel_frames.append(df_px)
 
         if args.html_report:
             pid_img_dir = html_dir / "images" / pid
@@ -311,6 +325,10 @@ def main():
         df_continuous_overall      = aggregate_continuous(df_continuous_frames, [])
         sheet_names += ["Continuous_Overall", "Continuous_Per_Pullback", "Continuous_Frame_Level"]
 
+    df_hfer, df_hfer_overall, df_pixels = build_hfer_tables(hfer_rows, pixel_frames, class_names)
+    if df_hfer is not None:
+        sheet_names += ["HFER_Per_Pullback", "HFER_Overall", "Pixels_Per_Frame"]
+
     excel_path = output_dir / "test_metrics.xlsx"
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         df_overall.to_excel(writer, sheet_name="Overall", index=False)
@@ -320,6 +338,10 @@ def main():
             df_continuous_overall.to_excel(writer, sheet_name="Continuous_Overall", index=False)
             df_continuous_per_pullback.to_excel(writer, sheet_name="Continuous_Per_Pullback", index=False)
             df_continuous_frames.to_excel(writer, sheet_name="Continuous_Frame_Level", index=False)
+        if df_hfer is not None:
+            df_hfer.to_excel(writer, sheet_name="HFER_Per_Pullback", index=False)
+            df_hfer_overall.to_excel(writer, sheet_name="HFER_Overall", index=False)
+            df_pixels.to_excel(writer, sheet_name="Pixels_Per_Frame", index=False)
 
     print(f"\n[INFO] Wrote {excel_path} (sheets: {', '.join(sheet_names)})")
 
@@ -334,6 +356,10 @@ def main():
         print("\n=== Overall continuous plaque-quantification metrics (N = frames with structure in BOTH GT and prediction) ===")
         print(df_continuous_overall[["metric", "N", "MAE", "Bias", "Mean_GT", "Mean_Pred"]]
               .to_string(index=False, float_format=lambda x: "nan" if math.isnan(x) else f"{x:.2f}"))
+
+    if df_hfer_overall is not None:
+        print("\n=== HFER (high-frequency energy ratio of per-class area along z; lower = smoother), mean over pullbacks ===")
+        print(df_hfer_overall.to_string(index=False, float_format=lambda x: "nan" if math.isnan(x) else f"{x:.2f}"))
 
     if args.html_report:
         if html_manifest:

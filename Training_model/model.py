@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms as T
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from config import Config
 
@@ -617,14 +617,28 @@ class DenseDecoder3D(nn.Module):
     """
 
     def __init__(self, feat_ch: int, num_classes: int, use_skip_connections: bool = False,
-                 encoder_depth: int = 3):
+                 encoder_depth: int = 3, skip_levels: Optional[Sequence[int]] = None):
         super().__init__()
         assert encoder_depth in (3, 5), f"encoder_depth must be 3 or 5, got {encoder_depth}"
-        assert encoder_depth == 3 or use_skip_connections, \
-            "DenseDecoder3D(encoder_depth=5) requires use_skip_connections=True (no-skip depth=5 not implemented)"
+        assert encoder_depth == 3 or use_skip_connections or skip_levels is not None, \
+            "DenseDecoder3D(encoder_depth=5) with use_skip_connections=False needs an explicit skip_levels (no skips at all = skip_levels=())"
         b = feat_ch // 4
+        # depth=5 only: which encoder levels (1=H/2 ... 4=H/16) are concatenated into the decoder.
+        # None + use_skip_connections=True = all four (original behaviour, state-dict unchanged);
+        # () = no skip connections at all (decoder sees only the bottleneck); (1,) = L1 skip only.
+        # Every level still gets its fuse conv, whose input is just narrower when its skip is
+        # dropped, so the spatial path / depth / Z restoration is identical across variants.
+        if encoder_depth == 5:
+            if skip_levels is None:
+                skip_levels = (1, 2, 3, 4)
+            assert set(skip_levels) <= {1, 2, 3, 4}, f"skip_levels must be a subset of 1-4, got {skip_levels}"
+            use_skip_connections = True   # skip-style decoder structure (Z restored at up3)
+            self.skip_levels = frozenset(skip_levels)
+        else:
+            self.skip_levels = frozenset()
         self.use_skip      = use_skip_connections
         self.encoder_depth = encoder_depth
+        sk = lambda lvl, ch: ch if lvl in self.skip_levels else 0   # channels a level's skip adds to its fuse conv
 
         # Mirror z_conv: feat_ch → 4b, z-axis kernel only
         self.z_deconv = nn.Sequential(
@@ -640,12 +654,12 @@ class DenseDecoder3D(nn.Module):
             # upsample needed yet, channels stay at 4b through both.
             self.up_l4 = DecBlock3D(4 * b, 4 * b)   # H/32 → H/16
             self.fuse_l4 = nn.Sequential(
-                nn.Conv3d(4 * b + 4 * b, 4 * b, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.Conv3d(4 * b + sk(4, 4 * b), 4 * b, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
                 nn.GroupNorm(min(8, 4 * b), 4 * b), nn.ReLU(inplace=True),
             )
             self.up_l3 = DecBlock3D(4 * b, 4 * b)   # H/16 → H/8
             self.fuse_l3 = nn.Sequential(
-                nn.Conv3d(4 * b + 4 * b, 4 * b, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.Conv3d(4 * b + sk(3, 4 * b), 4 * b, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
                 nn.GroupNorm(min(8, 4 * b), 4 * b), nn.ReLU(inplace=True),
             )
 
@@ -658,7 +672,7 @@ class DenseDecoder3D(nn.Module):
         if use_skip_connections:
             # layer2 is [4b, H/4] — resolution now matches up3's output (Z included), concat directly.
             self.fuse1 = nn.Sequential(
-                nn.Conv3d(4 * b + 4 * b, 2 * b, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.Conv3d(4 * b + (sk(2, 4 * b) if encoder_depth == 5 else 4 * b), 2 * b, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
                 nn.GroupNorm(min(8, 2 * b), 2 * b),
                 nn.ReLU(inplace=True),
             )
@@ -667,7 +681,7 @@ class DenseDecoder3D(nn.Module):
             up2_scale = (1, 2, 2) if encoder_depth == 5 else (2, 2, 2)
             self.up2 = DecBlock3D(2 * b, 2 * b, scale_factor=up2_scale)   # H/4→H/2  mirrors layer2
             self.fuse2 = nn.Sequential(
-                nn.Conv3d(2 * b + 2 * b, b, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+                nn.Conv3d(2 * b + (sk(1, 2 * b) if encoder_depth == 5 else 2 * b), b, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
                 nn.GroupNorm(min(8, b), b),
                 nn.ReLU(inplace=True),
             )
@@ -698,12 +712,20 @@ class DenseDecoder3D(nn.Module):
         """
         x = self.z_deconv(feat_vol)
         if self.encoder_depth == 5:
-            assert layer3 is not None and layer4 is not None, \
-                "DenseDecoder3D(encoder_depth=5) requires layer3 and layer4"
+            # a level's feature is only needed (and only concatenated) if it is in skip_levels
+            feats = {1: layer1, 2: layer2, 3: layer3, 4: layer4}
+            for lvl in self.skip_levels:
+                assert feats[lvl] is not None, f"DenseDecoder3D skip level {lvl} is enabled but layer{lvl} was not passed"
+            fuse_in = lambda x, lvl: torch.cat([x, feats[lvl]], dim=1) if lvl in self.skip_levels else x
             x = self.up_l4(x)
-            x = self.fuse_l4(torch.cat([x, layer4], dim=1))
+            x = self.fuse_l4(fuse_in(x, 4))
             x = self.up_l3(x)
-            x = self.fuse_l3(torch.cat([x, layer3], dim=1))
+            x = self.fuse_l3(fuse_in(x, 3))
+            x = self.up3(x)
+            x = self.fuse1(fuse_in(x, 2))
+            x = self.up2(x)
+            x = self.fuse2(fuse_in(x, 1))
+            return self.head(self.up1(x))
         x = self.up3(x)
         if self.use_skip:
             assert layer1 is not None and layer2 is not None, \
@@ -854,19 +876,48 @@ class INR(nn.Module):
     """
 
     def __init__(self, in_dim: int, hidden: int, out_dim: int, depth: int = 4,
-                 activation: str = "relu", omega_0: float = 30.0, extra_dim: int = 0):
+                 activation: str = "relu", omega_0: float = 30.0, extra_dim: int = 0,
+                 extra_all_layers: bool = False,
+                 slot_extra_dims: Optional[List[int]] = None):
         super().__init__()
         assert depth >= 2, "Need at least 2 layers for the skip connection"
         assert activation in ("relu", "siren"), f"Unknown activation: {activation}"
 
         mid = depth // 2
+        # Staged injection: slot_extra_dims[i] extra channels enter hidden-width layer i
+        # (0 = input layer, 1..mid-1 = pre-skip, mid = midpoint skip, mid+1..depth-1 = post-skip;
+        # exactly `depth` slots). forward() then takes `extra` as a list of per-slot tensors.
+        self.staged = slot_extra_dims is not None
+        if self.staged:
+            assert len(slot_extra_dims) == depth, \
+                f"slot_extra_dims needs one entry per hidden-width layer ({depth}), got {len(slot_extra_dims)}"
+            assert activation == "relu", "staged injection is ReLU-only"
+            assert not extra_all_layers and extra_dim == 0, "staged injection replaces extra_dim/extra_all_layers"
+            self.slot_extra_dims = list(slot_extra_dims)
+            self.activation = activation
+            self.omega_0    = omega_0
+            self.extra_dim  = 0
+            self.extra_all  = False
+            self.input_layer      = nn.Linear(in_dim + slot_extra_dims[0], hidden)
+            self.layers_pre_skip  = nn.ModuleList([nn.Linear(hidden + slot_extra_dims[1 + i], hidden)
+                                                   for i in range(mid - 1)])
+            self.skip_layer       = nn.Linear(in_dim + slot_extra_dims[mid] + hidden, hidden)
+            self.layers_post_skip = nn.ModuleList([nn.Linear(hidden + slot_extra_dims[mid + 1 + j], hidden)
+                                                   for j in range(depth - mid - 1)])
+            self.output_layer     = nn.Linear(hidden, out_dim)
+            self._relu = nn.ReLU(inplace=True)
+            return
         self.activation       = activation
         self.omega_0          = omega_0
-        self.extra_dim        = extra_dim   # features concatenated ONLY at the midpoint (skip) layer
-        self.input_layer      = nn.Linear(in_dim, hidden)
-        self.layers_pre_skip  = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(mid - 1)])
+        self.extra_dim        = extra_dim   # features concatenated at the midpoint (skip) layer, or at every layer
+        # extra_all_layers: `extra` is also concatenated into the input of every hidden-width layer
+        # (input, pre-skip, skip, post-skip), not only the midpoint skip layer. Output layer excluded.
+        self.extra_all        = extra_all_layers and extra_dim > 0
+        e_all                 = extra_dim if self.extra_all else 0
+        self.input_layer      = nn.Linear(in_dim + e_all, hidden)
+        self.layers_pre_skip  = nn.ModuleList([nn.Linear(hidden + e_all, hidden) for _ in range(mid - 1)])
         self.skip_layer       = nn.Linear(in_dim + extra_dim + hidden, hidden)
-        self.layers_post_skip = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(depth - mid - 1)])
+        self.layers_post_skip = nn.ModuleList([nn.Linear(hidden + e_all, hidden) for _ in range(depth - mid - 1)])
         self.output_layer     = nn.Linear(hidden, out_dim)
 
         if activation == "siren":
@@ -892,16 +943,34 @@ class INR(nn.Module):
 
     def forward(self, x: torch.Tensor, extra: Optional[torch.Tensor] = None) -> torch.Tensor:
         """[..., in_dim] (+ optional [..., extra_dim] fed only to the midpoint layer)  →  [..., out_dim]"""
-        h = self._act(self.input_layer(x))
-        for layer in self.layers_pre_skip:
-            h = self._act(layer(h))
+        if self.staged:
+            # `extra`: list with one entry per slot ([..., slot_extra_dims[i]] tensor, or None if 0 channels)
+            def _cat(t: torch.Tensor, i: int) -> torch.Tensor:
+                return torch.cat([t, extra[i]], dim=-1) if self.slot_extra_dims[i] > 0 else t
+            mid = len(self.layers_pre_skip) + 1
+            h = self._act(self.input_layer(_cat(x, 0)))
+            for i, layer in enumerate(self.layers_pre_skip):
+                h = self._act(layer(_cat(h, 1 + i)))
+            skip_in = [x, extra[mid], h] if self.slot_extra_dims[mid] > 0 else [x, h]
+            h = self._act(self.skip_layer(torch.cat(skip_in, dim=-1)))
+            for j, layer in enumerate(self.layers_post_skip):
+                h = self._act(layer(_cat(h, mid + 1 + j)))
+            return self.output_layer(h)
         if self.extra_dim > 0:
             assert extra is not None, "INR built with extra_dim>0 needs `extra` at forward"
+        # In "all" mode each layer sees [its usual input, extra]; otherwise `extra` is a no-op here.
+        def _in(t: torch.Tensor) -> torch.Tensor:
+            return torch.cat([t, extra], dim=-1) if self.extra_all else t
+
+        h = self._act(self.input_layer(_in(x)))
+        for layer in self.layers_pre_skip:
+            h = self._act(layer(_in(h)))
+        if self.extra_dim > 0:
             h = self._act(self.skip_layer(torch.cat([x, extra, h], dim=-1)))
         else:
             h = self._act(self.skip_layer(torch.cat([x, h], dim=-1)))
         for layer in self.layers_post_skip:
-            h = self._act(layer(h))
+            h = self._act(layer(_in(h)))
         return self.output_layer(h)
 
 
@@ -1059,8 +1128,24 @@ class ConditionalINR(nn.Module):
             # the same query coords as the bottleneck.
             ms_dim = sum(cfg.encoder_feat // 2 if l == 1 else cfg.encoder_feat for l in self.ms_levels)
         # "mid": the multiscale features skip the first MLP layer and enter only at the midpoint layer.
-        self.ms_at_mid = self.use_multiscale and cfg.multiscale_inject == "mid"
-        if not self.ms_at_mid:
+        # "all": the multiscale features enter every hidden-width MLP layer (incl. the midpoint one).
+        # Both "mid" and "all" keep them out of the shared `cond` vector and pass them as `extra`.
+        self.ms_at_mid = self.use_multiscale and cfg.multiscale_inject in ("mid", "all")
+        self.ms_all    = self.use_multiscale and cfg.multiscale_inject == "all"
+        # "staged": cfg.multiscale_schedule[i] lists the encoder levels that enter MLP hidden-width
+        # layer i (U-Net-style: a different scale at each depth). Overrides ms_levels with the union.
+        self.ms_staged = self.use_multiscale and cfg.multiscale_inject == "staged"
+        slot_extra_dims = None
+        if self.ms_staged:
+            max_lvl = 4 if cfg.encoder_depth == 5 else 2
+            assert all(l <= max_lvl for slot in cfg.multiscale_schedule for l in slot), \
+                f"multiscale_schedule {cfg.multiscale_schedule} uses levels the encoder_depth={cfg.encoder_depth} lacks"
+            self.ms_levels = sorted({l for slot in cfg.multiscale_schedule for l in slot})
+            assert self.ms_levels, "multiscale_schedule is empty"
+            slot_extra_dims = [sum(cfg.encoder_feat // 2 if l == 1 else cfg.encoder_feat for l in slot)
+                               for slot in cfg.multiscale_schedule]
+        self.ms_schedule = [list(s) for s in cfg.multiscale_schedule] if self.ms_staged else None
+        if not self.ms_at_mid and not self.ms_staged:
             cond_dim += ms_dim
 
         if cfg.encoder_type == "2.5d":
@@ -1105,6 +1190,8 @@ class ConditionalINR(nn.Module):
                 activation="relu",
                 omega_0=cfg.siren_omega_0,
                 extra_dim=ms_dim if self.ms_at_mid else 0,
+                extra_all_layers=self.ms_all,
+                slot_extra_dims=slot_extra_dims,
             )
 
         if cfg.feature_supervision:
@@ -1159,13 +1246,20 @@ class ConditionalINR(nn.Module):
                 local_feat = sample_features(feat_vol, coords_grid)      # [B, N, feat_ch]
                 cond_parts = [local_feat, g_feat_exp]
             ms_parts = []
+            sampled_lvls = {}
             if self.use_multiscale and layer1 is not None and layer2 is not None:
                 levels = {1: layer1, 2: layer2, 3: layer3, 4: layer4}    # 1: feat/2 ch, 2-4: feat ch
                 for lvl in self.ms_levels:
-                    ms_parts.append(sample_features(levels[lvl], coords_grid))   # [B, N, C_lvl]
-            ms_feat = torch.cat(ms_parts, dim=-1) if (self.ms_at_mid and ms_parts) else None
-            if not self.ms_at_mid:
-                cond_parts.extend(ms_parts)
+                    sampled_lvls[lvl] = sample_features(levels[lvl], coords_grid)   # [B, N, C_lvl]
+                    ms_parts.append(sampled_lvls[lvl])
+            if self.ms_staged:
+                # one tensor per MLP layer: concatenation of the levels scheduled for that layer
+                ms_feat = [torch.cat([sampled_lvls[l] for l in slot], dim=-1) if slot else None
+                           for slot in self.ms_schedule] if sampled_lvls else None
+            else:
+                ms_feat = torch.cat(ms_parts, dim=-1) if (self.ms_at_mid and ms_parts) else None
+                if not self.ms_at_mid:
+                    cond_parts.extend(ms_parts)
             cond = torch.cat(cond_parts, dim=-1)                         # [B, N, cond_dim]
         else:
             local_feat = None
@@ -1287,8 +1381,10 @@ class ResidualUNet3D(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         assert cfg.encoder_depth == 5, "ResidualUNet3D requires encoder_depth=5"
-        assert cfg.dense_decoder_skip_connections, \
-            "ResidualUNet3D requires dense_decoder_skip_connections=True (no-skip depth=5 not implemented)"
+        # cfg.unet_skip_levels: None = all four skips (the original U-Net); [] = no skip connections
+        # (ablation); [1] = L1 skip only (mirror of the INR's multiscale_levels=[1]).
+        assert cfg.dense_decoder_skip_connections or cfg.unet_skip_levels is not None, \
+            "ResidualUNet3D needs dense_decoder_skip_connections=True, or an explicit unet_skip_levels (e.g. [] for no skips)"
         self.cfg = cfg
         self.encoder = ResNetEncoder3D(
             in_ch=1, feat_ch=cfg.encoder_feat,
@@ -1300,6 +1396,7 @@ class ResidualUNet3D(nn.Module):
         self.dense_decoder = DenseDecoder3D(
             cfg.encoder_feat, cfg.num_classes,
             use_skip_connections=True, encoder_depth=5,
+            skip_levels=cfg.unet_skip_levels,
         )
 
     def forward(self, volume: torch.Tensor) -> torch.Tensor:

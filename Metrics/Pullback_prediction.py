@@ -94,7 +94,10 @@ from plaque_quantification import quantification_lipid, quantification_calcium
 # one definition of the color map / JPEG-rendering / HTML-building logic. It is
 # intentionally torch-free, so importing it here adds no extra heavy deps beyond
 # opencv-python (cv2).
-from create_html_report import to_uint8_display, colorize, blend_overlay, save_jpg, get_class_colors, build_html
+from create_html_report import (to_uint8_display, colorize, blend_overlay, save_jpg, get_class_colors,
+                                build_html, build_longitudinal_images)
+# HFER.py (same Metrics/ folder): longitudinal flicker of per-class area, computed on the full predicted volume.
+from HFER import add_hfer_args, compute_pullback_hfer, build_hfer_tables, load_exclusions
 
 _DEFAULT_POSTPROCESS_CONFIG = os.path.join(PIPELINE_DIR, "postprocessing_classes_conditionalinr.txt")
 _DEFAULT_LABEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "label_description_conditionalinr.txt")
@@ -314,6 +317,7 @@ def main():
     parser.add_argument("--skip_continuous_metrics", action="store_true",
                          help="Skip lipid arc/FCT/calcium arc/depth/thickness (plaque_quantification.py is slow "
                               "per frame when the structure is present -- adds real runtime on a full test set)")
+    add_hfer_args(parser)
     parser.add_argument("--label_file", type=str, default=_DEFAULT_LABEL_FILE,
                          help="ITK-SnAP label description matching this model's 12-class post-mapping taxonomy "
                               "(default: Metrics/label_description_conditionalinr.txt)")
@@ -325,6 +329,12 @@ def main():
     parser.add_argument("--html_alpha", type=float, default=0.45,
                          help="Overlay transparency for the HTML report's GT/prediction color coding")
     parser.add_argument("--html_jpeg_quality", type=int, default=90)
+    parser.add_argument("--no_longitudinal", action="store_true",
+                         help="With --html_report: skip the rotating longitudinal (L-mode) prediction view "
+                              "(built by default, same as create_html_report.py)")
+    parser.add_argument("--long_angle_step", type=int, default=15,
+                         help="Degrees between longitudinal rotation angles, spanning 0-165 deg "
+                              "(default 15 -> 12 angles); smaller = smoother rotation, proportionally more compute")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -361,6 +371,7 @@ def main():
     class_names  = get_class_names(num_classes)
 
     html_manifest: List[dict] = []
+    long_manifest: List[dict] = []
     class_colors = None
     html_dir = output_dir / "html_report"
     # output_dir already encodes --eval_resolution via its own "_encoderres" folder suffix
@@ -396,6 +407,9 @@ def main():
 
     frame_rows: List[dict] = []
     continuous_rows: List[dict] = []
+    hfer_rows: List[dict] = []
+    pixel_frames: List[pd.DataFrame] = []
+    hfer_exclusions = {} if args.skip_hfer else load_exclusions(args.exclusion_excel)
     n_done = 0
     for pid, ann_frames in pullback_to_frames.items():
         t0 = time.time()
@@ -475,9 +489,27 @@ def main():
             "downsampling have gone out of sync, would silently corrupt every Dice number."
         )
 
+        if not args.skip_hfer:
+            # Whole predicted volume (not just annotated frames): `pred` is the postprocessed file when
+            # --postprocess is set. Pixel counts are saved too so HFER can be recomputed at another cutoff.
+            hfer_row, df_px = compute_pullback_hfer(
+                pred, pid, class_names, args.hfer_threshold_cycles_per_mm, args.hfer_min_ac_power,
+                getattr(cfg, "z_spacing", 0.1), hfer_exclusions, args.hfer_min_stretch_frames)
+            hfer_rows.append(hfer_row)
+            pixel_frames.append(df_px)
+
         if args.html_report:
             pid_img_dir = html_dir / "images" / pid
             pid_img_dir.mkdir(parents=True, exist_ok=True)
+            if not args.no_longitudinal:
+                # Prediction-only L-mode view over ALL z (GT is sparse), from the same volume_eval/pred
+                # already in memory -- identical to what create_html_report.py's own main() builds.
+                angles = list(range(0, 180, args.long_angle_step))
+                long_manifest.extend(build_longitudinal_images(
+                    volume_eval, pred, angles, class_colors, args.html_alpha, pid, pid_img_dir,
+                    args.html_jpeg_quality,
+                ))
+                print(f"    + longitudinal view: {len(angles)} angles x {volume_eval.shape[0]} frames")
 
         for z in valid_frames:
             frame_class_rows = compare_frame(seg_eval[z], pred[z], num_classes)
@@ -575,6 +607,10 @@ def main():
         df_continuous_overall      = aggregate_continuous(df_continuous_frames, [])
         sheet_names += ["Continuous_Overall", "Continuous_Per_Pullback", "Continuous_Frame_Level"]
 
+    df_hfer, df_hfer_overall, df_pixels = build_hfer_tables(hfer_rows, pixel_frames, class_names)
+    if df_hfer is not None:
+        sheet_names += ["HFER_Per_Pullback", "HFER_Overall", "Pixels_Per_Frame"]
+
     excel_path = output_dir / "test_metrics.xlsx"
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         df_overall.to_excel(writer, sheet_name="Overall", index=False)
@@ -584,6 +620,10 @@ def main():
             df_continuous_overall.to_excel(writer, sheet_name="Continuous_Overall", index=False)
             df_continuous_per_pullback.to_excel(writer, sheet_name="Continuous_Per_Pullback", index=False)
             df_continuous_frames.to_excel(writer, sheet_name="Continuous_Frame_Level", index=False)
+        if df_hfer is not None:
+            df_hfer.to_excel(writer, sheet_name="HFER_Per_Pullback", index=False)
+            df_hfer_overall.to_excel(writer, sheet_name="HFER_Overall", index=False)
+            df_pixels.to_excel(writer, sheet_name="Pixels_Per_Frame", index=False)
 
     print(f"\n[INFO] Wrote {excel_path} (sheets: {', '.join(sheet_names)})")
 
@@ -599,15 +639,16 @@ def main():
         print(df_continuous_overall[["metric", "N", "MAE", "Bias", "Mean_GT", "Mean_Pred"]]
               .to_string(index=False, float_format=lambda x: "nan" if math.isnan(x) else f"{x:.2f}"))
 
+    if df_hfer_overall is not None:
+        print("\n=== HFER (high-frequency energy ratio of per-class area along z; lower = smoother), mean over pullbacks ===")
+        print(df_hfer_overall.to_string(index=False, float_format=lambda x: "nan" if math.isnan(x) else f"{x:.2f}"))
+
     if args.html_report:
         if html_manifest:
             report_path = html_dir / report_name
-            # long_manifest=[] -- this script only renders per-frame overlays, never the
-            # separate longitudinal-angle-sweep view create_html_report.py's own main() builds;
-            # the HTML's own JS handles an empty LONG_MANIFEST gracefully (just disables that
-            # view's toggle). build_html() gained this required param after this call site was
-            # written and was never updated -- --html_report has been broken here ever since.
-            build_html(html_manifest, [], class_names, class_colors, report_path)
+            # long_manifest is empty only with --no_longitudinal; the HTML's own JS then hides the
+            # longitudinal-view toggle.
+            build_html(html_manifest, long_manifest, class_names, class_colors, report_path)
             print(f"\n[INFO] Wrote HTML QC report: {report_path} ({len(html_manifest)} frames)")
         else:
             print("\n[WARN] --html_report was set but no frames were rendered -- nothing to write.")

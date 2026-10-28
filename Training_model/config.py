@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -34,6 +34,9 @@ class Config:
     # diagnostic head) and also by the standalone ResidualUNet2p5D (train_unet.py) — same flag,
     # same meaning, for either model.
     dense_decoder_skip_connections: bool = False
+    # ResidualUNet3D only: which encoder levels (1=H/2, 2=H/4, 3=H/8, 4=H/16) are skip-connected into the
+    # decoder. None = all four (original U-Net); [] = no skips; [1] = L1 only (mirrors multiscale_levels=[1]).
+    unet_skip_levels: Optional[List[int]] = None
     num_freqs_xy: int   = 6       # Fourier frequencies for x, y (fine in-plane detail)
     num_freqs_z:  int   = 4       # fewer frequencies for coarser z axis
     inr_hidden:   int   = 512
@@ -178,7 +181,17 @@ class Config:
     #   "mid":   NOT given to the first layer; concatenated only at the MLP's midpoint (NeRF-style
     #            skip) layer, next to the re-injected input and the hidden activations. ReLU MLP only
     #            (the SIREN/FiLM path conditions every layer on cond already).
+    #   "all":   concatenated into every hidden-width MLP layer (input, pre-skip, midpoint skip,
+    #            post-skip); the output layer is excluded. ReLU MLP only.
+    #   "staged": U-Net-style, a different set of levels at each MLP hidden-width layer, given by
+    #            multiscale_schedule (one list of levels per layer; inr_depth layers: input, pre-skip,
+    #            midpoint skip, post-skip). ReLU MLP only.
     multiscale_inject: str = "input"
+
+    # Only for multiscale_inject="staged": multiscale_schedule[i] = encoder levels (1-4) concatenated
+    # into MLP hidden-width layer i (0 = input layer ... inr_depth-1 = last hidden layer). [] = none.
+    # E.g. coarse->fine at inr_depth=4: [[4], [3], [2], [1]].
+    multiscale_schedule: List[List[int]] = field(default_factory=list)
 
     # Which encoder levels use_intermediate_features samples (1 = finest, H/2). Default: all
     # available (1-2 at depth 3, 1-4 at depth 5), i.e. the original behaviour. E.g. [1] = only the
@@ -342,10 +355,17 @@ class Config:
         assert len(self.multiscale_levels) > 0 and all(l in (1, 2, 3, 4) for l in self.multiscale_levels) \
             and len(set(self.multiscale_levels)) == len(self.multiscale_levels), \
             f"multiscale_levels must be distinct values from 1-4, got {self.multiscale_levels}"
-        assert self.multiscale_inject in ("input", "mid"), \
-            f"multiscale_inject must be 'input' or 'mid', got '{self.multiscale_inject}'"
-        assert not (self.multiscale_inject == "mid" and self.inr_activation == "siren"), \
-            "multiscale_inject='mid' is only implemented for the ReLU MLP (inr_activation='relu')"
+        assert self.multiscale_inject in ("input", "mid", "all", "staged"), \
+            f"multiscale_inject must be 'input', 'mid', 'all' or 'staged', got '{self.multiscale_inject}'"
+        assert not (self.multiscale_inject in ("mid", "all", "staged") and self.inr_activation == "siren"), \
+            "multiscale_inject='mid'/'all'/'staged' is only implemented for the ReLU MLP (inr_activation='relu')"
+        if self.multiscale_inject == "staged":
+            assert len(self.multiscale_schedule) == self.inr_depth, \
+                f"multiscale_schedule needs one entry per MLP hidden-width layer (inr_depth={self.inr_depth}), " \
+                f"got {len(self.multiscale_schedule)}"
+            assert all(isinstance(s, list) and all(l in (1, 2, 3, 4) for l in s)
+                       for s in self.multiscale_schedule), \
+                f"multiscale_schedule entries must be lists of levels 1-4, got {self.multiscale_schedule}"
         assert self.encoder_type in ("3d", "2.5d"), \
             f"encoder_type must be '3d' or '2.5d', got '{self.encoder_type}'"
         assert not (self.encoder_type == "2.5d" and (self.use_dense_decoder or self.use_intermediate_features)), \
